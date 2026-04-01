@@ -467,9 +467,9 @@ if st.session_state.results_df is not None:
                             "axis": {"range": [0, 100]},
                             "bar":  {"color": "#4c9be8"},
                             "steps": [
-                                {"range": [0,  33], "color": "#00c85340"},
-                                {"range": [33, 66], "color": "#ffd60030"},
-                                {"range": [66, 100],"color": "#d5000030"},
+                                {"range": [0,  33], "color": "rgba(0, 200, 83, 0.25)"},
+                                {"range": [33, 66], "color": "rgba(255, 214, 0, 0.2)"},
+                                {"range": [66, 100],"color": "rgba(213, 0, 0, 0.2)"},
                             ],
                         },
                         title={"text": "Near 52W Low (0%) → 52W High (100%)"},
