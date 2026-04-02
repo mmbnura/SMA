@@ -16,3 +16,4 @@ docker-compose.override.yml
 # Personal/Sensitive Data
 config.json
 credentials/
+nifty500_cache.csv
