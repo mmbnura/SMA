@@ -10,7 +10,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from screener import fetch_and_score, fetch_price_history, get_recommendation, REC_EMOJI
-from tickers import NIFTY500_STOCKS, ALL_SECTORS
+import tickers as _tickers_mod
+from tickers import load_nifty500, get_all_sectors, _LOAD_ERROR
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -81,6 +82,38 @@ with st.sidebar:
     st.caption("Fundamental screener for Nifty 500")
     st.divider()
 
+    # ── Load / refresh constituent list ──────────────────────────────────────
+    if "nifty500_stocks" not in st.session_state:
+        st.session_state.nifty500_stocks = _tickers_mod.NIFTY500_STOCKS
+        st.session_state.all_sectors     = _tickers_mod.ALL_SECTORS
+
+    col_ref1, col_ref2 = st.columns([3, 1])
+    with col_ref1:
+        n_total = len(st.session_state.nifty500_stocks)
+        if n_total:
+            st.success(f"✅ **{n_total}** Nifty 500 stocks loaded")
+        else:
+            st.error("❌ Could not load stock list")
+    with col_ref2:
+        if st.button("🔄", help="Re-fetch Nifty 500 list from NSE"):
+            with st.spinner("Fetching from NSE…"):
+                try:
+                    fresh = load_nifty500(force_refresh=True)
+                    st.session_state.nifty500_stocks = fresh
+                    st.session_state.all_sectors     = get_all_sectors(fresh)
+                    st.success(f"Refreshed — {len(fresh)} stocks")
+                    st.rerun()
+                except Exception as err:
+                    st.error(f"Fetch failed: {err}")
+
+    if _LOAD_ERROR:
+        st.warning(f"⚠️ NSE fetch error: {_LOAD_ERROR}")
+
+    NIFTY500_STOCKS = st.session_state.nifty500_stocks
+    ALL_SECTORS     = st.session_state.all_sectors
+
+    st.divider()
+
     # Sector filter
     st.subheader("🗂️ Sector Filter")
     select_all = st.checkbox("Select All Sectors", value=True)
@@ -90,7 +123,7 @@ with st.sidebar:
         selected_sectors = st.multiselect(
             "Choose sectors",
             ALL_SECTORS,
-            default=["IT", "Banking", "FMCG", "Pharma"],
+            default=[s for s in ["Information Technology", "Bank", "FMCG", "Pharmaceuticals"] if s in ALL_SECTORS],
         )
 
     filtered_stocks = [(t, n, s) for t, n, s in NIFTY500_STOCKS if s in selected_sectors]
@@ -467,9 +500,9 @@ if st.session_state.results_df is not None:
                             "axis": {"range": [0, 100]},
                             "bar":  {"color": "#4c9be8"},
                             "steps": [
-                                {"range": [0,  33], "color": "#00c85340"},
-                                {"range": [33, 66], "color": "#ffd60030"},
-                                {"range": [66, 100],"color": "#d5000030"},
+                                {"range": [0,  33], "color": "rgba(0, 200, 83, 0.25)"},
+                                {"range": [33, 66], "color": "rgba(255, 214, 0, 0.19)"},
+                                {"range": [66, 100],"color": "rgba(213, 0, 0, 0.19)"},
                             ],
                         },
                         title={"text": "Near 52W Low (0%) → 52W High (100%)"},
@@ -489,7 +522,7 @@ else:
     with cols[0]:
         st.markdown("### 🎯 What It Does")
         st.markdown("""
-- Scans up to **160 Nifty 500 stocks**
+- Scans all **500 official Nifty 500 stocks** (live from NSE)
 - Scores each on **7 fundamental criteria**
 - Ranks and recommends: Strong Buy / Buy / Hold / Avoid
 - Shows sector-level insights
@@ -513,7 +546,7 @@ else:
     with cols[2]:
         st.markdown("### ⏱️ Tips")
         st.markdown("""
-- Scanning all 160 stocks takes ~3–4 min
+- Scanning all 500 stocks takes ~10–15 min
 - Use **Sector Filter** to scan a subset quickly
 - Results are your **research shortlist**, not buy orders
 - Always read the company's annual report before investing
