@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "metrics": [
+    {
+      "id": "pe",
+      "label": "P/E",
+      "enabled": true,
+      "weight": 20.0,
+      "base_max": 20.0
+    },
+    {
+      "id": "pb",
+      "label": "P/B",
+      "enabled": true,
+      "weight": 15.0,
+      "base_max": 15.0
+    },
+    {
+      "id": "roe",
+      "label": "ROE",
+      "enabled": true,
+      "weight": 20.0,
+      "base_max": 20.0
+    },
+    {
+      "id": "de",
+      "label": "D/E",
+      "enabled": true,
+      "weight": 15.0,
+      "base_max": 15.0
+    },
+    {
+      "id": "eps",
+      "label": "EPS Growth",
+      "enabled": true,
+      "weight": 15.0,
+      "base_max": 15.0
+    },
+    {
+      "id": "rev",
+      "label": "Rev Growth",
+      "enabled": true,
+      "weight": 10.0,
+      "base_max": 10.0
+    },
+    {
+      "id": "div",
+      "label": "Div Yield",
+      "enabled": true,
+      "weight": 5.0,
+      "base_max": 5.0
+    }
+  ],
+  "recommendation_thresholds": {
+    "strong_buy": 75,
+    "buy": 60,
+    "hold": 45
+  }
+}

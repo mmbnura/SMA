@@ -5,6 +5,7 @@
 import io
 import os
 import time
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -12,7 +13,10 @@ import requests
 NSE_CSV_URL = (
     "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 )
-CACHE_FILE = os.path.join(os.path.dirname(__file__), "nifty500_cache.csv")
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_FILE = str(DATA_DIR / "nifty500_cache.csv")
 CACHE_MAX_AGE_SECONDS = 24 * 3600   # refresh once a day
 
 HEADERS = {

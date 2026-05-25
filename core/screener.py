@@ -3,7 +3,13 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from tickers import FINANCIAL_SECTORS
+from core.screening_logic import (
+    DEFAULT_RECOMMENDATION_THRESHOLDS,
+    METRIC_DEFINITIONS,
+    load_screening_config,
+    metric_lookup,
+)
+from core.tickers import FINANCIAL_SECTORS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCORING FUNCTIONS  (max points shown for each)
@@ -109,11 +115,19 @@ def score_div_yield(dy) -> tuple[int, str]:
 # RECOMMENDATION LABEL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_recommendation(score: int) -> tuple[str, str]:
+def get_recommendation(score: int, thresholds: dict | None = None) -> tuple[str, str]:
     """Return (label, colour_hex) based on composite score."""
-    if score >= 75: return "Strong Buy", "#00c853"
-    if score >= 60: return "Buy",        "#ffd600"
-    if score >= 45: return "Hold",       "#ff6d00"
+    cfg = thresholds or DEFAULT_RECOMMENDATION_THRESHOLDS
+    strong_buy = int(cfg.get("strong_buy", DEFAULT_RECOMMENDATION_THRESHOLDS["strong_buy"]))
+    buy = int(cfg.get("buy", DEFAULT_RECOMMENDATION_THRESHOLDS["buy"]))
+    hold = int(cfg.get("hold", DEFAULT_RECOMMENDATION_THRESHOLDS["hold"]))
+
+    if score >= strong_buy:
+        return "Strong Buy", "#00c853"
+    if score >= buy:
+        return "Buy", "#ffd600"
+    if score >= hold:
+        return "Hold", "#ff6d00"
     return "Avoid", "#d50000"
 
 
@@ -124,13 +138,52 @@ REC_EMOJI = {
     "Avoid":      "🔴",
 }
 
+
+def _apply_metric_configuration(
+    raw_scores: dict[str, float],
+    config: dict,
+) -> tuple[dict[str, float], dict[str, float], int]:
+    """Apply metric enable/weight config and return weighted metric scores and final 0-100 score."""
+    lookup = metric_lookup(config)
+    weighted_scores: dict[str, float] = {}
+    max_weights: dict[str, float] = {}
+    weighted_total = 0.0
+    max_total = 0.0
+
+    for metric in METRIC_DEFINITIONS:
+        metric_id = metric["id"]
+        base_max = float(metric["base_max"])
+        metric_cfg = lookup.get(metric_id, {})
+        enabled = bool(metric_cfg.get("enabled", True))
+        weight = float(metric_cfg.get("weight", base_max)) if enabled else 0.0
+        weight = max(0.0, weight)
+
+        raw = float(raw_scores.get(metric_id, 0.0))
+        raw = max(0.0, min(base_max, raw))
+        weighted = (raw / base_max * weight) if base_max > 0 else 0.0
+
+        weighted_scores[metric_id] = round(weighted, 2)
+        max_weights[metric_id] = round(weight, 2)
+        weighted_total += weighted
+        max_total += weight
+
+    final_score = int(round((weighted_total / max_total) * 100)) if max_total > 0 else 0
+    final_score = max(0, min(100, final_score))
+    return weighted_scores, max_weights, final_score
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN FETCH + SCORE FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_and_score(ticker: str, name: str, sector: str) -> dict | None:
+def fetch_and_score(
+    ticker: str,
+    name: str,
+    sector: str,
+    screening_config: dict | None = None,
+) -> dict | None:
     """Fetch fundamentals from yfinance and return a scored record dict."""
     try:
+        config = screening_config or load_screening_config()
         t = yf.Ticker(ticker)
         info = t.fast_info          # lightweight metadata first
 
@@ -160,8 +213,17 @@ def fetch_and_score(ticker: str, name: str, sector: str) -> dict | None:
         rev_s, rev_v = score_rev_growth(rev_g)
         div_s, div_v = score_div_yield(div_y)
 
-        total = pe_s + pb_s + roe_s + de_s + eps_s + rev_s + div_s
-        label, colour = get_recommendation(total)
+        raw_scores = {
+            "pe": pe_s,
+            "pb": pb_s,
+            "roe": roe_s,
+            "de": de_s,
+            "eps": eps_s,
+            "rev": rev_s,
+            "div": div_s,
+        }
+        weighted_scores, max_weights, total = _apply_metric_configuration(raw_scores, config)
+        label, colour = get_recommendation(total, thresholds=config.get("recommendation_thresholds"))
 
         # 52-week position (0–100%)
         if w52_hi and w52_lo and price and (w52_hi - w52_lo) > 0:
@@ -202,13 +264,20 @@ def fetch_and_score(ticker: str, name: str, sector: str) -> dict | None:
             "Rev Growth":     rev_v,
             "Div Yield":      div_v,
             # Component scores (for radar chart)
-            "s_PE":           pe_s,
-            "s_PB":           pb_s,
-            "s_ROE":          roe_s,
-            "s_DE":           de_s,
-            "s_EPS":          eps_s,
-            "s_Rev":          rev_s,
-            "s_Div":          div_s,
+            "s_PE":           weighted_scores["pe"],
+            "s_PB":           weighted_scores["pb"],
+            "s_ROE":          weighted_scores["roe"],
+            "s_DE":           weighted_scores["de"],
+            "s_EPS":          weighted_scores["eps"],
+            "s_Rev":          weighted_scores["rev"],
+            "s_Div":          weighted_scores["div"],
+            "m_PE":           max_weights["pe"],
+            "m_PB":           max_weights["pb"],
+            "m_ROE":          max_weights["roe"],
+            "m_DE":           max_weights["de"],
+            "m_EPS":          max_weights["eps"],
+            "m_Rev":          max_weights["rev"],
+            "m_Div":          max_weights["div"],
         }
     except Exception:
         return None
