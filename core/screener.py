@@ -451,23 +451,25 @@ def fetch_price_returns(tickers: list[str], start_date: str) -> dict[str, float]
     """
     Fetch price returns for a list of tickers from start_date to today.
     Returns a dict of {ticker: return_percentage}.
+    NIFTY 50 is stored under key "^NSEI".
     """
-    end_date = "2026-05-27"  # Today as per task requirements
+    from datetime import date as _date
+    end_date = _date.today().strftime("%Y-%m-%d")  # Always use actual today
     results = {}
-    
-    # Add NIFTY 50
+
+    # Add NIFTY 50 to the fetch list
     all_tickers = ["^NSEI"] + [t if t.endswith(".NS") else f"{t}.NS" for t in tickers]
-    
+
     try:
         data = yf.download(all_tickers, start=start_date, end=end_date, progress=False, auto_adjust=True)
         if data.empty:
             return {}
-        
+
         if isinstance(data.columns, pd.MultiIndex):
-            prices = data['Close']
+            prices = data["Close"]
         else:
-            prices = data[['Close']]
-            
+            prices = data[["Close"]]
+
         for ticker in all_tickers:
             try:
                 # Handle single vs multi ticker return from yfinance
@@ -475,24 +477,23 @@ def fetch_price_returns(tickers: list[str], start_date: str) -> dict[str, float]
                     series = prices
                 else:
                     series = prices[ticker]
-                
+
                 series = series.dropna()
                 if len(series) >= 2:
                     p_start = series.iloc[0]
                     p_end = series.iloc[-1]
-                    ret = (p_end - p_start) / p_start * 100
-                    clean_ticker = ticker.replace(".NS", "")
+                    ret = float((p_end - p_start) / p_start * 100)
                     if ticker == "^NSEI":
-                        results["NIFTY50"] = ret
+                        results["^NSEI"] = ret          # FIX: was "NIFTY50", now "^NSEI"
                     else:
-                        results[clean_ticker] = ret
+                        results[ticker.replace(".NS", "")] = ret
                 else:
                     results[ticker.replace(".NS", "")] = np.nan
             except Exception:
                 results[ticker.replace(".NS", "")] = np.nan
     except Exception:
         pass
-        
+
     return results
 
 
