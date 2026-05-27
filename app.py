@@ -1,5 +1,6 @@
 ﻿import time
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -9,7 +10,7 @@ import streamlit as st
 from core.screening_logic import load_screening_config
 from core import tickers as tickers_mod
 from core.scan_history import init_db, save_scan_run
-from core.screener import REC_EMOJI, fetch_and_score, fetch_price_history
+from core.screener import REC_EMOJI, fetch_and_score, fetch_price_history, fetch_and_cache_base_data, score_from_cached_base_data
 from core.tickers import _LOAD_ERROR, get_all_sectors, load_nifty500
 
 DISPLAY_COLS = [
@@ -239,24 +240,30 @@ def render_results(df_all: pd.DataFrame, min_score: int, rec_filter: list[str], 
 
             left, right = st.columns(2)
             with left:
-                categories = ["P/E", "P/B", "ROE", "D/E", "EPS Growth", "Rev Growth", "Div Yield"]
+                categories = ["P/E", "PEG", "P/B", "ROE", "ROA", "D/E", "FCF Yield", "Op Margin", "EPS Growth", "Rev Growth"]
                 scores = [
                     row.get("s_PE", 0),
+                    row.get("s_PEG", 0),
                     row.get("s_PB", 0),
                     row.get("s_ROE", 0),
+                    row.get("s_ROA", 0),
                     row.get("s_DE", 0),
+                    row.get("s_FCF", 0),
+                    row.get("s_OpM", 0),
                     row.get("s_EPS", 0),
                     row.get("s_Rev", 0),
-                    row.get("s_Div", 0),
                 ]
                 max_pts = [
-                    row.get("m_PE", 20),
-                    row.get("m_PB", 15),
-                    row.get("m_ROE", 20),
-                    row.get("m_DE", 15),
-                    row.get("m_EPS", 15),
-                    row.get("m_Rev", 10),
-                    row.get("m_Div", 5),
+                    row.get("m_PE", 12),
+                    row.get("m_PEG", 13),
+                    row.get("m_PB", 10),
+                    row.get("m_ROE", 13),
+                    row.get("m_ROA", 7),
+                    row.get("m_DE", 10),
+                    row.get("m_FCF", 10),
+                    row.get("m_OpM", 8),
+                    row.get("m_EPS", 10),
+                    row.get("m_Rev", 7),
                 ]
                 pct = [(s / m * 100) if m else 0 for s, m in zip(scores, max_pts)]
                 fig_r = go.Figure(
@@ -323,6 +330,12 @@ if "scan_time" not in st.session_state:
     st.session_state.scan_time = None
 if "last_scan_id" not in st.session_state:
     st.session_state.last_scan_id = None
+if "base_data_downloaded" not in st.session_state:
+    st.session_state.base_data_downloaded = False
+if "base_data_download_time" not in st.session_state:
+    st.session_state.base_data_download_time = None
+
+BASE_DATA_PATH = Path(__file__).resolve().parent / "data" / "base_data.csv"
 
 with st.sidebar:
     st.title("BAC SMA")
@@ -377,7 +390,13 @@ with st.sidebar:
     st.info(f"{len(filtered_stocks)} stocks in scope")
     st.divider()
 
-    scan_btn = st.button("Run Scan", type="primary", use_container_width=True)
+    st.subheader("Screening Controls")
+    download_btn = st.button("📥 Download Base Data", type="secondary", use_container_width=True, help="Manually download and cache fundamental data (optional - auto-downloaded on first scan)")
+    
+    st.divider()
+    
+    scan_btn = st.button("🎯 Run Scan", type="primary", use_container_width=True, help="Score stocks (downloads base data automatically if needed)")
+    
     if st.session_state.scan_time:
         st.caption(f"Last scan: {st.session_state.scan_time}")
     if st.session_state.last_scan_id:
@@ -405,62 +424,122 @@ st.caption(
     "Scans are automatically saved to local history."
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1: Download Base Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+if download_btn:
+    if not filtered_stocks:
+        st.error("No stocks selected. Please choose at least one sector.")
+    else:
+        st.info("📥 Downloading base data from Yahoo Finance...")
+        prog = st.progress(0, text="Starting download...")
+        status = st.empty()
+        download_started = datetime.now()
+        total = len(filtered_stocks)
+        
+        def progress_callback(i, total, ticker, name):
+            status.markdown(f"Fetching **{name}** ({i + 1}/{total})...")
+            prog.progress((i + 1) / total, text=f"{i + 1}/{total} stocks")
+        
+        base_df, fetched, failed = fetch_and_cache_base_data(
+            filtered_stocks,
+            str(BASE_DATA_PATH),
+            progress_callback=progress_callback
+        )
+        
+        prog.empty()
+        status.empty()
+        
+        download_time_str = download_started.strftime("%d %b %Y, %I:%M %p")
+        st.session_state.base_data_download_time = download_time_str
+        st.session_state.base_data_downloaded = True
+        
+        st.success(
+            f"✅ Base data downloaded successfully!\n\n"
+            f"**Fetched:** {fetched} stocks | **Failed:** {failed} stocks\n\n"
+            f"Now you can run the screening without re-downloading data."
+        )
+        st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2: Run Screening (from cached data)
+# ─────────────────────────────────────────────────────────────────────────────
+
 if scan_btn:
     if not filtered_stocks:
         st.error("No stocks selected. Please choose at least one sector.")
     else:
-        results = []
-        prog = st.progress(0, text="Starting scan...")
+        # Check if base data exists, download if needed
+        if not BASE_DATA_PATH.exists():
+            st.info("📥 Base data not found. Downloading from Yahoo Finance...")
+            prog = st.progress(0, text="Starting download...")
+            status = st.empty()
+            download_started = datetime.now()
+            total = len(filtered_stocks)
+            
+            def progress_callback(i, total, ticker, name):
+                status.markdown(f"Fetching **{name}** ({i + 1}/{total})...")
+                prog.progress((i + 1) / total, text=f"{i + 1}/{total} stocks")
+            
+            base_df, fetched, failed = fetch_and_cache_base_data(
+                filtered_stocks,
+                str(BASE_DATA_PATH),
+                progress_callback=progress_callback
+            )
+            
+            prog.empty()
+            status.empty()
+            
+            download_time_str = download_started.strftime("%d %b %Y, %I:%M %p")
+            st.session_state.base_data_download_time = download_time_str
+            st.session_state.base_data_downloaded = True
+            
+            st.info(f"✅ Base data downloaded | Fetched: {fetched} stocks | Failed: {failed}")
+        
+        # Now run screening from cached base data
+        st.info("🎯 Running screening from cached base data...")
         status = st.empty()
-        total = len(filtered_stocks)
+        prog = st.progress(0, text="Scoring stocks...")
         scan_started = datetime.now()
         screening_config = load_screening_config()
-
-        for i, (ticker, name, sector) in enumerate(filtered_stocks):
-            status.markdown(f"Fetching **{name}** ({i + 1}/{total})...")
-            prog.progress((i + 1) / total, text=f"{i + 1}/{total} stocks")
-            result = fetch_and_score(ticker, name, sector, screening_config=screening_config)
-            if result:
-                for legacy_col in ["Price (₹)", "Price (â‚¹)"]:
-                    if legacy_col in result and "Price (Rs)" not in result:
-                        result["Price (Rs)"] = result.pop(legacy_col)
-                        break
-                results.append(result)
-            time.sleep(0.05)
-
-        prog.empty()
-        status.empty()
-
-        results_df = pd.DataFrame(results) if results else pd.DataFrame(columns=DISPLAY_COLS)
-        st.session_state.results_df = results_df
-        st.session_state.scan_time = scan_started.strftime("%d %b %Y, %I:%M %p")
-
-        scan_type = "FULL" if select_all or len(selected_sectors) == len(all_sectors) else "SECTOR"
-        scan_id = build_scan_id(scan_type)
-        save_scan_run(
-            scan_id=scan_id,
-            scan_type=scan_type,
-            created_at=scan_started.isoformat(timespec="seconds"),
-            selected_sectors=selected_sectors,
-            total_in_scope=total,
-            total_scored=len(results),
-            results_df=results_df,
-        )
-        st.session_state.last_scan_id = scan_id
-
-        if results:
+        
+        try:
+            results_df = score_from_cached_base_data(
+                str(BASE_DATA_PATH),
+                sector_filter=selected_sectors,
+                screening_config=screening_config
+            )
+            
+            prog.empty()
+            status.empty()
+            
+            st.session_state.results_df = results_df
+            st.session_state.scan_time = scan_started.strftime("%d %b %Y, %I:%M %p")
+            
+            scan_type = "FULL" if select_all or len(selected_sectors) == len(all_sectors) else "SECTOR"
+            scan_id = build_scan_id(scan_type)
+            save_scan_run(
+                scan_id=scan_id,
+                scan_type=scan_type,
+                created_at=scan_started.isoformat(timespec="seconds"),
+                selected_sectors=selected_sectors,
+                total_in_scope=len(results_df),
+                total_scored=len(results_df),
+                results_df=results_df,
+            )
+            st.session_state.last_scan_id = scan_id
+            
             st.success(
-                f"Scan complete - fetched data for {len(results)} of {total} stocks. "
-                f"{total - len(results)} skipped. Saved as scan id: {scan_id}"
+                f"✅ Screening complete - scored {len(results_df)} stocks. "
+                f"Saved as scan id: {scan_id}"
             )
-        else:
-            st.warning(
-                f"Scan finished but no stock data was returned. "
-                f"Saved empty run as scan id: {scan_id}"
-            )
+        
+        except Exception as e:
+            st.error(f"Error during screening: {e}")
 
 if st.session_state.results_df is not None and not st.session_state.results_df.empty:
     render_results(st.session_state.results_df, min_score, rec_filter, key_prefix="live")
 else:
-    st.info("Select sectors in the sidebar and click Run Scan to begin.")
+    st.info("👉 Select sectors in the sidebar and click '🎯 Run Scan' to begin screening. Base data will be downloaded automatically on your first scan.")
 

@@ -5,50 +5,71 @@
       "id": "pe",
       "label": "P/E",
       "enabled": true,
-      "weight": 20.0,
-      "base_max": 20.0
+      "weight": 12.0,
+      "base_max": 12.0
+    },
+    {
+      "id": "peg",
+      "label": "PEG",
+      "enabled": true,
+      "weight": 13.0,
+      "base_max": 13.0
     },
     {
       "id": "pb",
       "label": "P/B",
       "enabled": true,
-      "weight": 15.0,
-      "base_max": 15.0
+      "weight": 10.0,
+      "base_max": 10.0
     },
     {
       "id": "roe",
       "label": "ROE",
       "enabled": true,
-      "weight": 20.0,
-      "base_max": 20.0
+      "weight": 13.0,
+      "base_max": 13.0
+    },
+    {
+      "id": "roa",
+      "label": "ROA",
+      "enabled": true,
+      "weight": 7.0,
+      "base_max": 7.0
     },
     {
       "id": "de",
       "label": "D/E",
       "enabled": true,
-      "weight": 15.0,
-      "base_max": 15.0
+      "weight": 10.0,
+      "base_max": 10.0
     },
     {
-      "id": "eps",
-      "label": "EPS Growth",
-      "enabled": true,
-      "weight": 15.0,
-      "base_max": 15.0
-    },
-    {
-      "id": "rev",
-      "label": "Rev Growth",
+      "id": "fcf_yield",
+      "label": "FCF Yield",
       "enabled": true,
       "weight": 10.0,
       "base_max": 10.0
     },
     {
-      "id": "div",
-      "label": "Div Yield",
+      "id": "op_margin",
+      "label": "Op Margin",
       "enabled": true,
-      "weight": 5.0,
-      "base_max": 5.0
+      "weight": 8.0,
+      "base_max": 8.0
+    },
+    {
+      "id": "eps_growth",
+      "label": "EPS Growth",
+      "enabled": true,
+      "weight": 10.0,
+      "base_max": 10.0
+    },
+    {
+      "id": "rev_growth",
+      "label": "Rev Growth",
+      "enabled": true,
+      "weight": 7.0,
+      "base_max": 7.0
     }
   ],
   "recommendation_thresholds": {

@@ -13,12 +13,15 @@
         "Score",
         "Recommendation",
         "P/E",
+        "PEG",
         "P/B",
         "ROE",
+        "ROA",
         "D/E",
+        "FCF Yield",
+        "Op Margin",
         "EPS Growth",
         "Rev Growth",
-        "Div Yield",
         "52W Position",
     ]
     
@@ -80,7 +83,7 @@
             "total_in_scope": "In Scope",
             "sector_count": "Sector Count",
         }
-    )
+    ).sort_values("Created At", ascending=False)
     
     st.subheader("Previous Scans")
     scan_ids = history_df["scan_id"].tolist()
@@ -158,6 +161,9 @@
             },
         )
     
+        if st.button("Verify Accuracy", use_container_width=True):
+            st.session_state.accuracy_scan_id = selected_scan_id
+            st.switch_page("pages/Accuracy_Verification.py")
     
 
 if __name__ == '__main__':
