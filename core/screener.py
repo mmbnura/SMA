@@ -1,737 +1,608 @@
-# screener.py — Fetch fundamentals from yfinance and score each stock with new 10-metric logic
+# screener.py — Fetch fundamentals from Yahoo Finance, cache them, and score each stock.
+#
+# Principle: nothing is assumed. A metric whose input is missing is marked
+# "not available" and excluded from the score (it is never scored as 0 or
+# given default points). Each stock reports how much of the scoring weight had
+# real data, and stocks below the configured minimum get "Insufficient Data"
+# instead of a recommendation.
 
+from __future__ import annotations
+
+import math
 import time
-import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable
+
 import pandas as pd
-import numpy as np
+import requests
+import yfinance as yf
+
 from core.screening_logic import (
+    DEFAULT_MIN_DATA_COVERAGE,
     DEFAULT_RECOMMENDATION_THRESHOLDS,
     METRIC_DEFINITIONS,
-    load_screening_config,
     metric_lookup,
 )
 from core.tickers import FINANCIAL_SECTORS
+from core.timeutil import IST, NSE_CLOSE, now_ist, parse_timestamp
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HARD FILTERS (Disqualify before scoring)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def apply_hard_filters(full_info: dict, sector: str) -> tuple[bool, str]:
-    """
-    Check hard filters. Returns (is_disqualified, reason).
-    If disqualified=True, do not score the stock.
-    """
-    current_ratio = full_info.get("currentRatio")
-    roe = full_info.get("returnOnEquity")
-    de_raw = full_info.get("debtToEquity")
-    free_cf = full_info.get("freeCashflow")
-    op_margin = full_info.get("operatingMargins")
-
-    # Filter 1: Current Ratio < 0.8
-    if current_ratio is not None and not pd.isna(current_ratio):
-        if float(current_ratio) < 0.8:
-            return True, "Current ratio < 0.8 (liquidity risk)"
-
-    # Filter 2: ROE negative for 2+ consecutive years
-    # (Simplified: if latest ROE is negative, assume sustained losses)
-    if roe is not None and not pd.isna(roe) and float(roe) < 0:
-        return True, "ROE negative (sustained losses)"
-
-    # Filter 3: D/E > 3.0 for non-financial (skip for Banking/NBFC)
-    if sector not in FINANCIAL_SECTORS:
-        if de_raw is not None and not pd.isna(de_raw):
-            de = float(de_raw) / 100  # normalize to ratio
-            if de > 3.0:
-                return True, "D/E > 3.0 (excessive leverage)"
-
-    # Filter 4: Free cash flow negative AND operating margin < 0
-    if free_cf is not None and not pd.isna(free_cf) and float(free_cf) < 0:
-        if op_margin is not None and not pd.isna(op_margin):
-            if float(op_margin) < 0:
-                return True, "Negative FCF + negative op margin (cash burn)"
-
-    return False, ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCORING FUNCTIONS  (max points shown for each)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def score_pe(pe) -> tuple[float, str]:
-    """P/E Ratio — max 12 pts. Inverse capped curve."""
-    if pe is None or pd.isna(pe) or pe <= 0:
-        return 0.0, "N/A"
-    v = float(pe)
-    if v <= 10:
-        return 12.0, f"{v:.1f}"
-    if v <= 20:
-        return 12.0 - (v - 10) * (12 - 9) / 10, f"{v:.1f}"  # linear 12→9
-    if v <= 40:
-        return 9.0 - (v - 20) * (9 - 4) / 20, f"{v:.1f}"    # linear 9→4
-    if v <= 60:
-        return 4.0 - (v - 40) * 4 / 20, f"{v:.1f}"          # linear 4→0
-    return 0.0, f"{v:.1f}"
-
-
-def score_peg(peg) -> tuple[float, str]:
-    """PEG Ratio — max 13 pts. Inverse capped curve."""
-    if peg is None or pd.isna(peg) or peg <= 0:
-        return 0.0, "N/A"
-    v = float(peg)
-    if v <= 0.75:
-        return 13.0, f"{v:.2f}"
-    if v <= 1.5:
-        return 13.0 - (v - 0.75) * (13 - 7) / 0.75, f"{v:.2f}"  # linear 13→7
-    if v <= 3.0:
-        return 7.0 - (v - 1.5) * 7 / 1.5, f"{v:.2f}"             # linear 7→0
-    return 0.0, f"{v:.2f}"
-
-
-def score_pb(pb) -> tuple[float, str]:
-    """P/B Ratio — max 10 pts. Inverse capped curve."""
-    if pb is None or pd.isna(pb) or pb <= 0:
-        return 0.0, "N/A"
-    v = float(pb)
-    if v <= 1.0:
-        return 10.0, f"{v:.2f}"
-    if v <= 3.0:
-        return 10.0 - (v - 1.0) * (10 - 6) / 2.0, f"{v:.2f}"  # linear 10→6
-    if v <= 8.0:
-        return 6.0 - (v - 3.0) * 6 / 5.0, f"{v:.2f}"          # linear 6→0
-    return 0.0, f"{v:.2f}"
-
-
-def score_roe(roe) -> tuple[float, str]:
-    """Return on Equity — max 13 pts. Log ascending curve."""
-    if roe is None or pd.isna(roe):
-        return 0.0, "N/A"
-    v = float(roe) * 100  # yfinance returns as decimal
-    if v < 0:
-        return 0.0, f"{v:.1f}%"
-    if v <= 8:
-        return v * 5 / 8, f"{v:.1f}%"                          # linear 0→5
-    if v <= 20:
-        return 5.0 + (v - 8) * (11 - 5) / 12, f"{v:.1f}%"      # linear 5→11
-    if v <= 40:
-        return 11.0 + (v - 20) * (13 - 11) / 20, f"{v:.1f}%"   # linear 11→13
-    return 13.0, f"{v:.1f}%"
-
-
-def score_roa(roa) -> tuple[float, str]:
-    """Return on Assets — max 7 pts. Log ascending curve."""
-    if roa is None or pd.isna(roa):
-        return 0.0, "N/A"
-    v = float(roa) * 100
-    if v < 0:
-        return 0.0, f"{v:.1f}%"
-    if v <= 5:
-        return v * 3 / 5, f"{v:.1f}%"                          # linear 0→3
-    if v <= 15:
-        return 3.0 + (v - 5) * (6 - 3) / 10, f"{v:.1f}%"       # linear 3→6
-    if v <= 25:
-        return 6.0 + (v - 15) * (7 - 6) / 10, f"{v:.1f}%"      # linear 6→7
-    return 7.0, f"{v:.1f}%"
-
-
-def score_de(de_raw, sector) -> tuple[float, str]:
-    """Debt-to-Equity — max 10 pts. Inverse exp curve.
-    Banking/NBFC/Insurance get sector_neutral score of 5.
-    yfinance returns D/E as a percentage (e.g. 150 = 1.5×).
-    """
-    if sector in FINANCIAL_SECTORS:
-        return 5.0, "N/A (Fin.)"
-    if de_raw is None or pd.isna(de_raw):
-        return 0.0, "N/A"
-    de = float(de_raw) / 100
-    if de <= 0.3:
-        return 10.0, f"{de:.2f}x"
-    if de <= 1.0:
-        return 10.0 - (de - 0.3) * (10 - 6) / 0.7, f"{de:.2f}x"  # linear 10→6
-    if de <= 2.0:
-        return 6.0 - (de - 1.0) * (6 - 3) / 1.0, f"{de:.2f}x"    # linear 6→3
-    if de <= 3.0:
-        return 3.0 - (de - 2.0) * 3, f"{de:.2f}x"               # linear 3→0
-    return 0.0, f"{de:.2f}x"
-
-
-def score_fcf_yield(market_cap, free_cf) -> tuple[float, str]:
-    """FCF Yield — max 10 pts. Log ascending curve.
-    Yield = (freeCashflow / marketCap) * 100
-    """
-    if market_cap is None or free_cf is None or pd.isna(market_cap) or pd.isna(free_cf):
-        return 0.0, "N/A"
-    if market_cap <= 0:
-        return 0.0, "N/A"
-    yield_pct = (float(free_cf) / float(market_cap)) * 100
-    if yield_pct < 0:
-        return 0.0, f"{yield_pct:.2f}%"
-    if yield_pct <= 2:
-        return yield_pct * 3 / 2, f"{yield_pct:.2f}%"                     # linear 0→3
-    if yield_pct <= 8:
-        return 3.0 + (yield_pct - 2) * (9 - 3) / 6, f"{yield_pct:.2f}%"   # linear 3→9
-    if yield_pct <= 15:
-        return 9.0 + (yield_pct - 8) * (10 - 9) / 7, f"{yield_pct:.2f}%"  # linear 9→10
-    return 10.0, f"{yield_pct:.2f}%"
-
-
-def score_op_margin(op_margin) -> tuple[float, str]:
-    """Operating Margin — max 8 pts. Log ascending curve."""
-    if op_margin is None or pd.isna(op_margin):
-        return 0.0, "N/A"
-    v = float(op_margin) * 100
-    if v < 0:
-        return 0.0, f"{v:.1f}%"
-    if v <= 5:
-        return v * 2 / 5, f"{v:.1f}%"                          # linear 0→2
-    if v <= 15:
-        return 2.0 + (v - 5) * (5 - 2) / 10, f"{v:.1f}%"       # linear 2→5
-    if v <= 25:
-        return 5.0 + (v - 15) * (7 - 5) / 10, f"{v:.1f}%"      # linear 5→7
-    if v <= 40:
-        return 7.0 + (v - 25) * (8 - 7) / 15, f"{v:.1f}%"      # linear 7→8
-    return 8.0, f"{v:.1f}%"
-
-
-def score_eps_growth(eps_g) -> tuple[float, str]:
-    """EPS Growth — max 10 pts. Log ascending with negative penalty."""
-    if eps_g is None or pd.isna(eps_g):
-        return 0.0, "N/A"
-    v = float(eps_g) * 100
-    if v < -10:
-        return 0.0, f"{v:.1f}%"
-    if v <= 0:
-        return (v + 10) * 2 / 10, f"{v:.1f}%"                   # linear 0→2
-    if v <= 10:
-        return 2.0 + v * (5 - 2) / 10, f"{v:.1f}%"              # linear 2→5
-    if v <= 25:
-        return 5.0 + (v - 10) * (9 - 5) / 15, f"{v:.1f}%"       # linear 5→9
-    if v <= 60:
-        return 9.0 + (v - 25) * (10 - 9) / 35, f"{v:.1f}%"      # linear 9→10
-    return 10.0, f"{v:.1f}%"
-
-
-def score_rev_growth(rev_g) -> tuple[float, str]:
-    """Revenue Growth — max 7 pts. Log ascending."""
-    if rev_g is None or pd.isna(rev_g):
-        return 0.0, "N/A"
-    v = float(rev_g) * 100
-    if v < -5:
-        return 0.0, f"{v:.1f}%"
-    if v <= 0:
-        return (v + 5) * 1 / 5, f"{v:.1f}%"                     # linear 0→1
-    if v <= 10:
-        return 1.0 + v * (4 - 1) / 10, f"{v:.1f}%"              # linear 1→4
-    if v <= 20:
-        return 4.0 + (v - 10) * (6 - 4) / 10, f"{v:.1f}%"       # linear 4→6
-    if v <= 50:
-        return 6.0 + (v - 20) * (7 - 6) / 30, f"{v:.1f}%"       # linear 6→7
-    return 7.0, f"{v:.1f}%"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RECOMMENDATION LABEL
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_recommendation(score: int, thresholds: dict | None = None) -> tuple[str, str]:
-    """Return (label, colour_hex) based on composite score."""
-    cfg = thresholds or DEFAULT_RECOMMENDATION_THRESHOLDS
-    strong_buy = int(cfg.get("strong_buy", 75))
-    buy = int(cfg.get("buy", 60))
-    hold = int(cfg.get("hold", 45))
-
-    if score >= strong_buy:
-        return "Strong Buy", "#00c853"
-    if score >= buy:
-        return "Buy", "#ffd600"
-    if score >= hold:
-        return "Hold", "#ff6d00"
-    return "Avoid", "#d50000"
-
-
+NOT_AVAILABLE = "Not available"
+INSUFFICIENT_DATA = "Insufficient Data"
+RECOMMENDATION_ORDER = ["Strong Buy", "Buy", "Hold", "Avoid", INSUFFICIENT_DATA]
+REC_COLOURS = {
+    "Strong Buy": "#00a843",
+    "Buy": "#c9a800",
+    "Hold": "#ff6d00",
+    "Avoid": "#d50000",
+    INSUFFICIENT_DATA: "#8a8f98",
+}
 REC_EMOJI = {
     "Strong Buy": "🟢",
-    "Buy":        "🟡",
-    "Hold":       "🟠",
-    "Avoid":      "🔴",
+    "Buy": "🟡",
+    "Hold": "🟠",
+    "Avoid": "🔴",
+    INSUFFICIENT_DATA: "⚪",
+}
+
+NIFTY50 = "^NSEI"
+
+# Raw Yahoo Finance `info` fields stored in the base-data cache.
+YF_FIELDS = [
+    "trailingPE",
+    "pegRatio",
+    "trailingPegRatio",
+    "priceToBook",
+    "returnOnEquity",
+    "returnOnAssets",
+    "debtToEquity",
+    "marketCap",
+    "freeCashflow",
+    "operatingMargins",
+    "earningsQuarterlyGrowth",
+    "revenueGrowth",
+    "fiftyTwoWeekHigh",
+    "fiftyTwoWeekLow",
+    "currentRatio",
+    "currency",
+    "financialCurrency",
+]
+BASE_COLUMNS = ["Ticker", "Name", "Sector", "lastPrice", "fetched_at", *YF_FIELDS]
+TEXT_FIELDS = {"Ticker", "Name", "Sector", "fetched_at", "currency", "financialCurrency"}
+
+
+def to_number(value: Any) -> float | None:
+    """Convert to a finite float, or None when the value is missing or not numeric."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _interp(x: float, points: list[tuple[float, float]]) -> float:
+    """Piecewise-linear interpolation, clamped to the end points."""
+    if x <= points[0][0]:
+        return points[0][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x <= x1:
+            return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
+    return points[-1][1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# METRICS — each returns (value, points, status, note)
+#   status: "ok" | "missing" | "not_applicable"
+# ─────────────────────────────────────────────────────────────────────────────
+
+CURVES = {
+    "pe": [(10, 12), (20, 9), (40, 4), (60, 0)],
+    "peg": [(0.75, 13), (1.5, 7), (3.0, 0)],
+    "pb": [(1.0, 10), (3.0, 6), (8.0, 0)],
+    "roe": [(0, 0), (8, 5), (20, 11), (40, 13)],
+    "roa": [(0, 0), (5, 3), (15, 6), (25, 7)],
+    "de": [(0.3, 10), (1.0, 6), (2.0, 3), (3.0, 0)],
+    "fcf_yield": [(0, 0), (2, 3), (8, 9), (15, 10)],
+    "op_margin": [(0, 0), (5, 2), (15, 5), (25, 7), (40, 8)],
+    "eps_growth": [(-10, 0), (0, 2), (10, 5), (25, 9), (60, 10)],
+    "rev_growth": [(-5, 0), (0, 1), (10, 4), (20, 6), (50, 7)],
 }
 
 
-def _apply_metric_configuration(
-    raw_scores: dict[str, float],
-    config: dict,
-) -> tuple[dict[str, float], dict[str, float], int]:
-    """Apply metric enable/weight config and return weighted metric scores and final 0-100 score."""
-    lookup = metric_lookup(config)
-    weighted_scores: dict[str, float] = {}
-    max_weights: dict[str, float] = {}
-    weighted_total = 0.0
-    max_total = 0.0
+@dataclass
+class MetricResult:
+    value: float | None
+    points: float | None
+    status: str
+    note: str = ""
 
-    for metric in METRIC_DEFINITIONS:
-        metric_id = metric["id"]
-        base_max = float(metric["base_max"])
-        metric_cfg = lookup.get(metric_id, {})
-        enabled = bool(metric_cfg.get("enabled", True))
-        weight = float(metric_cfg.get("weight", base_max)) if enabled else 0.0
-        weight = max(0.0, weight)
 
-        raw = float(raw_scores.get(metric_id, 0.0))
-        raw = max(0.0, min(base_max, raw))
-        weighted = (raw / base_max * weight) if base_max > 0 else 0.0
+def _missing(note: str = "not provided by Yahoo Finance") -> MetricResult:
+    return MetricResult(None, None, "missing", note)
 
-        weighted_scores[metric_id] = round(weighted, 2)
-        max_weights[metric_id] = round(weight, 2)
-        weighted_total += weighted
-        max_total += weight
 
-    final_score = int(round((weighted_total / max_total) * 100)) if max_total > 0 else 0
-    final_score = max(0, min(100, final_score))
-    return weighted_scores, max_weights, final_score
+def _valuation(metric_id: str, raw_value: Any, negative_note: str) -> MetricResult:
+    v = to_number(raw_value)
+    if v is None:
+        return _missing()
+    if v <= 0:
+        return MetricResult(v, 0.0, "ok", negative_note)
+    return MetricResult(v, _interp(v, CURVES[metric_id]), "ok")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN FETCH + SCORE FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_and_score(
-    ticker: str,
-    name: str,
-    sector: str,
-    screening_config: dict | None = None,
-) -> dict | None:
-    """Fetch fundamentals from yfinance and return a scored record dict.
-    Applies hard filters first; returns None if disqualified.
-    """
-    try:
-        config = screening_config or load_screening_config()
-        t = yf.Ticker(ticker)
-        info = t.fast_info
+def _percent(metric_id: str, raw_value: Any) -> MetricResult:
+    v = to_number(raw_value)
+    if v is None:
+        return _missing()
+    v *= 100  # Yahoo reports these as decimals
+    return MetricResult(v, _interp(v, CURVES[metric_id]), "ok")
 
-        price = getattr(info, "last_price", None)
-        if price is None or price == 0:
-            return None
 
-        full = t.info
+def compute_metrics(raw: dict[str, Any], sector: str) -> dict[str, MetricResult]:
+    peg_raw = raw.get("pegRatio")
+    if to_number(peg_raw) is None:
+        peg_raw = raw.get("trailingPegRatio")
 
-        # ─ APPLY HARD FILTERS ─
-        is_disq, disq_reason = apply_hard_filters(full, sector)
-        if is_disq:
-            return {
-                "Ticker": ticker.replace(".NS", ""),
-                "Name": name,
-                "Sector": sector,
-                "Status": "DISQUALIFIED",
-                "Reason": disq_reason,
-            }
+    results = {
+        "pe": _valuation("pe", raw.get("trailingPE"), "zero/negative earnings"),
+        "peg": _valuation("peg", peg_raw, "negative earnings growth"),
+        "pb": _valuation("pb", raw.get("priceToBook"), "negative book value"),
+        "roe": _percent("roe", raw.get("returnOnEquity")),
+        "roa": _percent("roa", raw.get("returnOnAssets")),
+        "op_margin": _percent("op_margin", raw.get("operatingMargins")),
+        "eps_growth": _percent("eps_growth", raw.get("earningsQuarterlyGrowth")),
+        "rev_growth": _percent("rev_growth", raw.get("revenueGrowth")),
+    }
 
-        # ─ FETCH ALL FIELDS ─
-        pe = full.get("trailingPE")
-        peg = full.get("pegRatio")
-        pb = full.get("priceToBook")
-        roe = full.get("returnOnEquity")
-        roa = full.get("returnOnAssets")
-        de_raw = full.get("debtToEquity")
-        market_cap = full.get("marketCap")
-        free_cf = full.get("freeCashflow")
-        op_margin = full.get("operatingMargins")
-        eps_g = full.get("earningsQuarterlyGrowth")
-        rev_g = full.get("revenueGrowth")
-        w52_hi = full.get("fiftyTwoWeekHigh")
-        w52_lo = full.get("fiftyTwoWeekLow")
-
-        # ─ SCORE EACH METRIC ─
-        pe_s, pe_v = score_pe(pe)
-        peg_s, peg_v = score_peg(peg)
-        pb_s, pb_v = score_pb(pb)
-        roe_s, roe_v = score_roe(roe)
-        roa_s, roa_v = score_roa(roa)
-        de_s, de_v = score_de(de_raw, sector)
-        fcf_s, fcf_v = score_fcf_yield(market_cap, free_cf)
-        op_s, op_v = score_op_margin(op_margin)
-        eps_s, eps_v = score_eps_growth(eps_g)
-        rev_s, rev_v = score_rev_growth(rev_g)
-
-        raw_scores = {
-            "pe": pe_s,
-            "peg": peg_s,
-            "pb": pb_s,
-            "roe": roe_s,
-            "roa": roa_s,
-            "de": de_s,
-            "fcf_yield": fcf_s,
-            "op_margin": op_s,
-            "eps_growth": eps_s,
-            "rev_growth": rev_s,
-        }
-        weighted_scores, max_weights, total = _apply_metric_configuration(raw_scores, config)
-        label, colour = get_recommendation(total, thresholds=config.get("recommendation_thresholds"))
-
-        # 52-week position
-        if w52_hi and w52_lo and price and (w52_hi - w52_lo) > 0:
-            w52_pos = round((price - w52_lo) / (w52_hi - w52_lo) * 100, 1)
+    if sector in FINANCIAL_SECTORS:
+        results["de"] = MetricResult(None, None, "not_applicable", "not applicable to financial sector")
+    else:
+        de_pct = to_number(raw.get("debtToEquity"))
+        if de_pct is None:
+            results["de"] = _missing()
         else:
-            w52_pos = None
+            de = de_pct / 100  # Yahoo reports D/E in percent
+            if de < 0:
+                results["de"] = MetricResult(de, 0.0, "ok", "negative shareholder equity")
+            else:
+                results["de"] = MetricResult(de, _interp(de, CURVES["de"]), "ok")
 
-        # Market cap bucket
-        if market_cap:
-            if market_cap >= 2e12:       cap_label = "Large (>₹2T)"
-            elif market_cap >= 5e11:     cap_label = "Mid (₹0.5–2T)"
-            else:                        cap_label = "Small (<₹0.5T)"
-        else:
-            cap_label = "N/A"
-
-        return {
-            # Identity
-            "Ticker":         ticker.replace(".NS", ""),
-            "Name":           name,
-            "Sector":         sector,
-            "Status":         "SCORED",
-            # Price info
-            "Price (₹)":      round(price, 2),
-            "52W High":       round(w52_hi, 2)  if w52_hi else None,
-            "52W Low":        round(w52_lo, 2)  if w52_lo else None,
-            "52W Position":   w52_pos,
-            "Market Cap":     market_cap,
-            "Cap Bucket":     cap_label,
-            # Composite
-            "Score":          total,
-            "Recommendation": label,
-            "Colour":         colour,
-            # Display values
-            "P/E":            pe_v,
-            "PEG":            peg_v,
-            "P/B":            pb_v,
-            "ROE":            roe_v,
-            "ROA":            roa_v,
-            "D/E":            de_v,
-            "FCF Yield":      fcf_v,
-            "Op Margin":      op_v,
-            "EPS Growth":     eps_v,
-            "Rev Growth":     rev_v,
-            # Component scores (for radar chart)
-            "s_PE":           weighted_scores["pe"],
-            "s_PEG":          weighted_scores["peg"],
-            "s_PB":           weighted_scores["pb"],
-            "s_ROE":          weighted_scores["roe"],
-            "s_ROA":          weighted_scores["roa"],
-            "s_DE":           weighted_scores["de"],
-            "s_FCF":          weighted_scores["fcf_yield"],
-            "s_OpM":          weighted_scores["op_margin"],
-            "s_EPS":          weighted_scores["eps_growth"],
-            "s_Rev":          weighted_scores["rev_growth"],
-            "m_PE":           max_weights["pe"],
-            "m_PEG":          max_weights["peg"],
-            "m_PB":           max_weights["pb"],
-            "m_ROE":          max_weights["roe"],
-            "m_ROA":          max_weights["roa"],
-            "m_DE":           max_weights["de"],
-            "m_FCF":          max_weights["fcf_yield"],
-            "m_OpM":          max_weights["op_margin"],
-            "m_EPS":          max_weights["eps_growth"],
-            "m_Rev":          max_weights["rev_growth"],
-        }
-    except Exception:
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER: fetch 1-year price history for deep-dive chart
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_price_history(ticker: str) -> pd.DataFrame:
-    try:
-        df = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-def fetch_price_returns(tickers: list[str], start_date: str) -> dict[str, float]:
-    """
-    Fetch price returns for a list of tickers from start_date to today.
-    Returns a dict of {ticker: return_percentage}.
-    NIFTY 50 is stored under key "^NSEI".
-    """
-    from datetime import date as _date
-    end_date = _date.today().strftime("%Y-%m-%d")  # Always use actual today
-    results = {}
-
-    # Add NIFTY 50 to the fetch list
-    all_tickers = ["^NSEI"] + [t if t.endswith(".NS") else f"{t}.NS" for t in tickers]
-
-    try:
-        data = yf.download(all_tickers, start=start_date, end=end_date, progress=False, auto_adjust=True)
-        if data.empty:
-            return {}
-
-        if isinstance(data.columns, pd.MultiIndex):
-            prices = data["Close"]
-        else:
-            prices = data[["Close"]]
-
-        for ticker in all_tickers:
-            try:
-                # Handle single vs multi ticker return from yfinance
-                if isinstance(prices, pd.Series):
-                    series = prices
-                else:
-                    series = prices[ticker]
-
-                series = series.dropna()
-                if len(series) >= 2:
-                    p_start = series.iloc[0]
-                    p_end = series.iloc[-1]
-                    ret = float((p_end - p_start) / p_start * 100)
-                    if ticker == "^NSEI":
-                        results["^NSEI"] = ret          # FIX: was "NIFTY50", now "^NSEI"
-                    else:
-                        results[ticker.replace(".NS", "")] = ret
-                else:
-                    results[ticker.replace(".NS", "")] = np.nan
-            except Exception:
-                results[ticker.replace(".NS", "")] = np.nan
-    except Exception:
-        pass
+    market_cap = to_number(raw.get("marketCap"))
+    free_cf = to_number(raw.get("freeCashflow"))
+    price_ccy = _text(raw.get("currency"))
+    stmt_ccy = _text(raw.get("financialCurrency"))
+    if market_cap is None or market_cap <= 0 or free_cf is None:
+        results["fcf_yield"] = _missing()
+    elif price_ccy is None or stmt_ccy is None:
+        results["fcf_yield"] = _missing("reporting currency not available, so the yield cannot be verified")
+    elif price_ccy != stmt_ccy:
+        results["fcf_yield"] = _missing(f"cash flow reported in {stmt_ccy}, market cap in {price_ccy}")
+    else:
+        y = free_cf / market_cap * 100
+        results["fcf_yield"] = MetricResult(y, _interp(y, CURVES["fcf_yield"]), "ok")
 
     return results
 
 
-def calculate_outperformance(stock_return: float, nifty_return: float) -> float:
-    if pd.isna(stock_return) or pd.isna(nifty_return):
-        return np.nan
-    return stock_return - nifty_return
+# ─────────────────────────────────────────────────────────────────────────────
+# HARD FILTERS — only evaluated on data that exists
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_hard_filters(raw: dict[str, Any], sector: str) -> list[str]:
+    """Return the list of disqualification reasons (empty if the stock passes)."""
+    reasons = []
+    financial = sector in FINANCIAL_SECTORS
+
+    current_ratio = to_number(raw.get("currentRatio"))
+    if not financial and current_ratio is not None and current_ratio < 0.8:
+        reasons.append(f"Current ratio {current_ratio:.2f} is below 0.8 (liquidity risk)")
+
+    roe = to_number(raw.get("returnOnEquity"))
+    if roe is not None and roe < 0:
+        reasons.append(f"Trailing 12-month ROE is negative ({roe * 100:.1f}%)")
+
+    de_pct = to_number(raw.get("debtToEquity"))
+    if not financial and de_pct is not None and de_pct / 100 > 3.0:
+        reasons.append(f"Debt/Equity {de_pct / 100:.2f}x is above 3.0x (excessive leverage)")
+
+    free_cf = to_number(raw.get("freeCashflow"))
+    op_margin = to_number(raw.get("operatingMargins"))
+    if free_cf is not None and op_margin is not None and free_cf < 0 and op_margin < 0:
+        reasons.append(
+            f"Negative free cash flow and negative operating margin ({op_margin * 100:.1f}%) — cash burn"
+        )
+
+    return reasons
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWO-STEP SCREENING: Download base data → Cache locally → Apply scoring
+# SCORING
 # ─────────────────────────────────────────────────────────────────────────────
+
+def get_recommendation(score: int | None, coverage: float | None, config: dict) -> str:
+    thresholds = config.get("recommendation_thresholds") or DEFAULT_RECOMMENDATION_THRESHOLDS
+    min_cov = config.get("min_data_coverage", DEFAULT_MIN_DATA_COVERAGE)
+    if score is None or coverage is None or coverage < min_cov:
+        return INSUFFICIENT_DATA
+    if score >= thresholds["strong_buy"]:
+        return "Strong Buy"
+    if score >= thresholds["buy"]:
+        return "Buy"
+    if score >= thresholds["hold"]:
+        return "Hold"
+    return "Avoid"
+
+
+def _combine(metrics: dict[str, MetricResult], config: dict) -> dict[str, Any]:
+    lookup = metric_lookup(config)
+    out: dict[str, Any] = {}
+    earned = 0.0
+    available_weight = 0.0
+    applicable_weight = 0.0
+    gaps = []
+
+    for metric in METRIC_DEFINITIONS:
+        mid = metric["id"]
+        cfg = lookup.get(mid, {})
+        weight = float(cfg.get("weight", metric["base_max"])) if cfg.get("enabled", True) else 0.0
+        result = metrics[mid]
+
+        out[metric["column"]] = result.value
+        out[metric["score_col"]] = None
+        out[metric["max_col"]] = weight
+
+        if result.status != "ok":
+            if weight > 0:
+                gaps.append(f"{metric['label']}: {result.note}")
+            if result.status == "not_applicable":
+                out[metric["max_col"]] = 0.0
+            else:
+                applicable_weight += weight
+            continue
+
+        weighted = result.points / metric["base_max"] * weight
+        out[metric["score_col"]] = round(weighted, 2)
+        if weight > 0:
+            earned += weighted
+            available_weight += weight
+            applicable_weight += weight
+
+    score = int(round(earned / available_weight * 100)) if available_weight > 0 else None
+    coverage = round(available_weight / applicable_weight * 100, 1) if applicable_weight > 0 else None
+
+    out["Score"] = score
+    out["Data Coverage %"] = coverage
+    out["Unavailable Metrics"] = "; ".join(gaps) if gaps else ""
+    out["Recommendation"] = get_recommendation(score, coverage, config)
+    return out
+
+
+def score_stock(raw: dict[str, Any], ticker: str, name: str, sector: str, config: dict) -> dict[str, Any]:
+    """Score one stock from raw Yahoo fields. Returns a record with Status SCORED or DISQUALIFIED."""
+    fetched_at = parse_timestamp(_text(raw.get("fetched_at")))
+    base = {
+        "Ticker": ticker,
+        "Name": name,
+        "Sector": sector,
+        "Data As Of": fetched_at.strftime("%Y-%m-%d %H:%M IST") if fetched_at else NOT_AVAILABLE,
+    }
+
+    reasons = apply_hard_filters(raw, sector)
+    if reasons:
+        return {**base, "Status": "DISQUALIFIED", "Reason": "; ".join(reasons)}
+
+    price = to_number(raw.get("lastPrice"))
+    hi = to_number(raw.get("fiftyTwoWeekHigh"))
+    lo = to_number(raw.get("fiftyTwoWeekLow"))
+    market_cap = to_number(raw.get("marketCap"))
+    price_ccy = _text(raw.get("currency"))
+
+    w52_pos = None
+    if price is not None and hi is not None and lo is not None and hi > lo:
+        w52_pos = round((price - lo) / (hi - lo) * 100, 1)
+
+    mcap_cr = None
+    if market_cap is not None and market_cap > 0 and price_ccy in (None, "INR"):
+        mcap_cr = round(market_cap / 1e7, 0)
+
+    record = {
+        **base,
+        "Status": "SCORED",
+        "Price (₹)": round(price, 2) if price is not None else None,
+        "Market Cap (₹ Cr)": mcap_cr,
+        "52W High": round(hi, 2) if hi is not None else None,
+        "52W Low": round(lo, 2) if lo is not None else None,
+        "52W Position %": w52_pos,
+    }
+    record.update(_combine(compute_metrics(raw, sector), config))
+    return record
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BASE DATA: fetch from Yahoo and cache locally (upsert per ticker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FetchError(Exception):
+    pass
+
+
+def _with_retries(fn: Callable[[], Any], attempts: int = 3, base_delay: float = 1.5) -> Any:
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as err:  # yfinance raises many error types
+            last_err = err
+            if attempt < attempts - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_err  # type: ignore[misc]
+
+
+YAHOO_PROBE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=1d&interval=1d"
+
+
+def check_yahoo_reachable(timeout: float = 10.0) -> str | None:
+    """Return None if Yahoo Finance answers at all, else a readable reason."""
+    try:
+        requests.get(YAHOO_PROBE_URL, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        return None  # any HTTP response (even 401/429) means the host is reachable
+    except requests.RequestException as err:
+        return f"Cannot reach Yahoo Finance ({type(err).__name__}). Check the internet connection or proxy."
+
+
+def fetch_fundamentals(yf_ticker: str) -> dict[str, Any]:
+    """Fetch raw fundamentals for one ticker. Raises FetchError with a readable reason."""
+    t = yf.Ticker(yf_ticker)
+    try:
+        info = _with_retries(lambda: t.info) or {}
+    except Exception as err:
+        raise FetchError(f"Yahoo Finance request failed: {type(err).__name__}: {err}") from err
+
+    # yfinance returns an (almost) empty dict instead of raising on network errors,
+    # rate limits and unknown symbols, so these cannot be told apart here.
+    if not any(info.get(k) for k in ("symbol", "quoteType", "shortName", "longName")):
+        raise FetchError(
+            "Yahoo Finance returned no data for this symbol (network error, rate limit, "
+            "or the symbol is not available on Yahoo)"
+        )
+
+    price = to_number(info.get("currentPrice")) or to_number(info.get("regularMarketPrice"))
+    if price is None:
+        try:
+            price = to_number(getattr(t.fast_info, "last_price", None))
+        except Exception:
+            price = None
+    if price is None or price <= 0:
+        raise FetchError("Yahoo Finance returned company data but no current price (trading may be suspended)")
+
+    record = {field_name: info.get(field_name) for field_name in YF_FIELDS}
+    record["lastPrice"] = price
+    record["fetched_at"] = now_ist().isoformat(timespec="seconds")
+    return record
+
+
+def load_base_cache(path: str | Path) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame(columns=BASE_COLUMNS)
+    df = pd.read_csv(path, dtype={"Ticker": str})
+    for col in BASE_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[BASE_COLUMNS].drop_duplicates("Ticker", keep="last").reset_index(drop=True)
+
+
+def cache_age_summary(cache: pd.DataFrame, tickers: list[str]) -> dict[str, Any]:
+    """Freshness of cached data for the given base tickers (no .NS)."""
+    by_ticker = cache.set_index("Ticker")["fetched_at"].to_dict() if not cache.empty else {}
+    missing, undated, times = [], [], []
+    for tk in tickers:
+        if tk not in by_ticker:
+            missing.append(tk)
+            continue
+        ts = parse_timestamp(_text(by_ticker[tk]))
+        if ts is None:
+            undated.append(tk)
+        else:
+            times.append((tk, ts))
+    return {"missing": missing, "undated": undated, "dated": times}
+
+
+def tickers_needing_fetch(cache: pd.DataFrame, tickers: list[str], max_age_hours: float) -> list[str]:
+    summary = cache_age_summary(cache, tickers)
+    cutoff = now_ist() - timedelta(hours=max_age_hours)
+    stale = [tk for tk, ts in summary["dated"] if ts < cutoff]
+    return summary["missing"] + summary["undated"] + stale
+
 
 def fetch_and_cache_base_data(
     stocks: list[tuple[str, str, str]],
-    output_path: str,
-    progress_callback=None,
-) -> tuple[pd.DataFrame, int, int]:
+    cache_path: str | Path,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    max_workers: int = 4,
+) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+    """Fetch fundamentals for `stocks` and upsert them into the cache.
+
+    Returns (updated cache, failures). Stocks that fail keep any older cached
+    row; the failure list says so.
     """
-    Fetch raw fundamental data from yfinance for all stocks and cache to CSV.
-    Returns (dataframe, total_fetched, total_failed)
-    
-    Args:
-        stocks: List of (ticker, name, sector) tuples
-        output_path: Path to save base_data.csv
-        progress_callback: Optional callable(i, total, ticker, name) for UI updates
-    """
-    from pathlib import Path
-    
-    base_data = []
-    total_failed = 0
-    
-    for i, (ticker, name, sector) in enumerate(stocks):
-        if progress_callback:
-            progress_callback(i, len(stocks), ticker, name)
-        
-        try:
-            t = yf.Ticker(ticker)
-            info = t.fast_info
-            price = getattr(info, "last_price", None)
-            
-            if price is None or price == 0:
-                total_failed += 1
-                continue
-            
-            full = t.info
-            
-            # Store all fundamental data
-            record = {
-                "Ticker": ticker.replace(".NS", ""),
+    cache = load_base_cache(cache_path)
+    cached_tickers = set(cache["Ticker"])
+    fetched: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    total = len(stocks)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(fetch_fundamentals, yf_t): (yf_t, n, s) for yf_t, n, s in stocks}
+        for done, future in enumerate(as_completed(futures), start=1):
+            yf_t, name, sector = futures[future]
+            base = yf_t.replace(".NS", "")
+            try:
+                row = future.result()
+                row.update({"Ticker": base, "Name": name, "Sector": sector})
+                fetched.append(row)
+            except Exception as err:
+                reason = str(err) if isinstance(err, FetchError) else f"{type(err).__name__}: {err}"
+                if base in cached_tickers:
+                    reason += " — older cached data kept"
+                failures.append({"Ticker": base, "Name": name, "Sector": sector, "Reason": reason})
+            if progress_callback:
+                progress_callback(done, total, name)
+
+    if fetched:
+        new_rows = pd.DataFrame(fetched)[BASE_COLUMNS]
+        refreshed = set(new_rows["Ticker"])
+        cache = pd.concat(
+            [cache[~cache["Ticker"].isin(refreshed)], new_rows], ignore_index=True
+        ) if not cache.empty else new_rows
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cache.to_csv(path, index=False)
+
+    return cache, failures
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCAN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sort_scored(df: pd.DataFrame) -> pd.DataFrame:
+    """Rated stocks by score (high first), then 'Insufficient Data' stocks."""
+    if df.empty:
+        return df
+    insufficient = (df["Recommendation"] == INSUFFICIENT_DATA).astype(int)
+    order = pd.DataFrame({"i": insufficient, "s": df["Score"]}).sort_values(
+        ["i", "s"], ascending=[True, False], na_position="last"
+    ).index
+    return df.loc[order].reset_index(drop=True)
+
+
+@dataclass
+class ScanResult:
+    scored: pd.DataFrame
+    disqualified: pd.DataFrame
+    unavailable: pd.DataFrame
+    in_scope: int = 0
+    notes: list[str] = field(default_factory=list)
+
+
+def run_scan(
+    stocks: list[tuple[str, str, str]],
+    cache: pd.DataFrame,
+    config: dict,
+    fetch_failures: list[dict[str, str]] | None = None,
+) -> ScanResult:
+    """Score every in-scope stock that has cached data; account for the rest."""
+    failure_reasons = {f["Ticker"]: f["Reason"] for f in (fetch_failures or [])}
+    rows = cache.set_index("Ticker").to_dict(orient="index") if not cache.empty else {}
+
+    scored, disqualified, unavailable = [], [], []
+    for yf_t, name, sector in stocks:
+        base = yf_t.replace(".NS", "")
+        raw = rows.get(base)
+        if raw is None:
+            unavailable.append({
+                "Ticker": base,
                 "Name": name,
                 "Sector": sector,
-                "trailingPE": full.get("trailingPE"),
-                "pegRatio": full.get("pegRatio"),
-                "priceToBook": full.get("priceToBook"),
-                "returnOnEquity": full.get("returnOnEquity"),
-                "returnOnAssets": full.get("returnOnAssets"),
-                "debtToEquity": full.get("debtToEquity"),
-                "marketCap": full.get("marketCap"),
-                "freeCashflow": full.get("freeCashflow"),
-                "operatingMargins": full.get("operatingMargins"),
-                "earningsQuarterlyGrowth": full.get("earningsQuarterlyGrowth"),
-                "revenueGrowth": full.get("revenueGrowth"),
-                "lastPrice": price,
-                "fiftyTwoWeekHigh": full.get("fiftyTwoWeekHigh"),
-                "fiftyTwoWeekLow": full.get("fiftyTwoWeekLow"),
-                "currentRatio": full.get("currentRatio"),
-            }
-            base_data.append(record)
-            time.sleep(0.05)  # Rate limit
-        
-        except Exception:
-            total_failed += 1
+                "Reason": failure_reasons.get(base, "No fundamental data has been downloaded for this stock"),
+            })
             continue
-    
-    # Save to CSV
-    df = pd.DataFrame(base_data)
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_file, index=False)
-    
-    return df, len(base_data), total_failed
+        record = score_stock(raw, base, name, sector, config)
+        (disqualified if record["Status"] == "DISQUALIFIED" else scored).append(record)
+
+    scored_df = sort_scored(pd.DataFrame(scored))
+    return ScanResult(
+        scored=scored_df,
+        disqualified=pd.DataFrame(disqualified, columns=["Ticker", "Name", "Sector", "Data As Of", "Status", "Reason"]),
+        unavailable=pd.DataFrame(unavailable, columns=["Ticker", "Name", "Sector", "Reason"]),
+        in_scope=len(stocks),
+    )
 
 
-def score_from_cached_base_data(
-    base_data_path: str,
-    sector_filter: list[str] | None = None,
-    screening_config: dict | None = None,
-) -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────────────────────
+# PRICE DATA (deep dive chart and accuracy verification)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_price_history(yf_ticker: str, period: str = "1y") -> pd.DataFrame:
+    try:
+        df = yf.download(yf_ticker, period=period, progress=False, auto_adjust=False)
+    except Exception:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def reference_close_date(fetched_at: datetime) -> date:
+    """Latest session whose official close was known when the data was fetched.
+
+    Before 15:30 IST the latest settled close is from an earlier day.
     """
-    Load cached base data and apply scoring + filtering.
-    Returns scored dataframe ready for display.
-    
-    Args:
-        base_data_path: Path to base_data.csv
-        sector_filter: Optional list of sectors to filter
-        screening_config: Optional screening config (uses default if None)
+    local = fetched_at.astimezone(IST)
+    if local.time() >= NSE_CLOSE:
+        return local.date()
+    return local.date() - timedelta(days=1)
+
+
+def fetch_close_prices(yf_tickers: list[str], start: date) -> pd.DataFrame:
+    """Daily closes (split-adjusted, not dividend-adjusted) from `start` to today.
+
+    Columns are the requested tickers; tickers Yahoo could not serve are absent
+    or entirely NaN.
     """
-    config = screening_config or load_screening_config()
-    
-    # Load cached base data
-    base_df = pd.read_csv(base_data_path)
-    
-    # Filter by sector if provided
-    if sector_filter:
-        base_df = base_df[base_df["Sector"].isin(sector_filter)]
-    
-    results = []
-    for _, row in base_df.iterrows():
-        ticker = row["Ticker"]
-        name = row["Name"]
-        sector = row["Sector"]
-        
-        # Build full_info dict from cached data
-        full_info = {
-            "trailingPE": row.get("trailingPE"),
-            "pegRatio": row.get("pegRatio"),
-            "priceToBook": row.get("priceToBook"),
-            "returnOnEquity": row.get("returnOnEquity"),
-            "returnOnAssets": row.get("returnOnAssets"),
-            "debtToEquity": row.get("debtToEquity"),
-            "marketCap": row.get("marketCap"),
-            "freeCashflow": row.get("freeCashflow"),
-            "operatingMargins": row.get("operatingMargins"),
-            "earningsQuarterlyGrowth": row.get("earningsQuarterlyGrowth"),
-            "revenueGrowth": row.get("revenueGrowth"),
-            "fiftyTwoWeekHigh": row.get("fiftyTwoWeekHigh"),
-            "fiftyTwoWeekLow": row.get("fiftyTwoWeekLow"),
-            "currentRatio": row.get("currentRatio"),
-        }
-        
-        # Apply hard filters
-        is_disq, disq_reason = apply_hard_filters(full_info, sector)
-        if is_disq:
-            continue
-        
-        # Extract metrics
-        price = row.get("lastPrice")
-        pe = full_info.get("trailingPE")
-        peg = full_info.get("pegRatio")
-        pb = full_info.get("priceToBook")
-        roe = full_info.get("returnOnEquity")
-        roa = full_info.get("returnOnAssets")
-        de_raw = full_info.get("debtToEquity")
-        market_cap = full_info.get("marketCap")
-        free_cf = full_info.get("freeCashflow")
-        op_margin = full_info.get("operatingMargins")
-        eps_g = full_info.get("earningsQuarterlyGrowth")
-        rev_g = full_info.get("revenueGrowth")
-        w52_hi = full_info.get("fiftyTwoWeekHigh")
-        w52_lo = full_info.get("fiftyTwoWeekLow")
-        
-        # Score metrics
-        pe_s, pe_v = score_pe(pe)
-        peg_s, peg_v = score_peg(peg)
-        pb_s, pb_v = score_pb(pb)
-        roe_s, roe_v = score_roe(roe)
-        roa_s, roa_v = score_roa(roa)
-        de_s, de_v = score_de(de_raw, sector)
-        fcf_s, fcf_v = score_fcf_yield(market_cap, free_cf)
-        op_s, op_v = score_op_margin(op_margin)
-        eps_s, eps_v = score_eps_growth(eps_g)
-        rev_s, rev_v = score_rev_growth(rev_g)
-        
-        raw_scores = {
-            "pe": pe_s,
-            "peg": peg_s,
-            "pb": pb_s,
-            "roe": roe_s,
-            "roa": roa_s,
-            "de": de_s,
-            "fcf_yield": fcf_s,
-            "op_margin": op_s,
-            "eps_growth": eps_s,
-            "rev_growth": rev_s,
-        }
-        weighted_scores, max_weights, total = _apply_metric_configuration(raw_scores, config)
-        label, colour = get_recommendation(total, thresholds=config.get("recommendation_thresholds"))
-        
-        # 52-week position
-        if w52_hi and w52_lo and price and (w52_hi - w52_lo) > 0:
-            w52_pos = round((price - w52_lo) / (w52_hi - w52_lo) * 100, 1)
-        else:
-            w52_pos = None
-        
-        # Market cap bucket
-        if market_cap:
-            if market_cap >= 2e12:       cap_label = "Large (>₹2T)"
-            elif market_cap >= 5e11:     cap_label = "Mid (₹0.5–2T)"
-            else:                        cap_label = "Small (<₹0.5T)"
-        else:
-            cap_label = "N/A"
-        
-        result = {
-            "Ticker": ticker,
-            "Name": name,
-            "Sector": sector,
-            "Status": "SCORED",
-            "Price (Rs)": round(price, 2) if price else None,
-            "52W High": round(w52_hi, 2) if w52_hi else None,
-            "52W Low": round(w52_lo, 2) if w52_lo else None,
-            "52W Position": w52_pos,
-            "Market Cap": market_cap,
-            "Cap Bucket": cap_label,
-            "Score": total,
-            "Recommendation": label,
-            "Colour": colour,
-            "P/E": pe_v,
-            "PEG": peg_v,
-            "P/B": pb_v,
-            "ROE": roe_v,
-            "ROA": roa_v,
-            "D/E": de_v,
-            "FCF Yield": fcf_v,
-            "Op Margin": op_v,
-            "EPS Growth": eps_v,
-            "Rev Growth": rev_v,
-            "s_PE": weighted_scores["pe"],
-            "s_PEG": weighted_scores["peg"],
-            "s_PB": weighted_scores["pb"],
-            "s_ROE": weighted_scores["roe"],
-            "s_ROA": weighted_scores["roa"],
-            "s_DE": weighted_scores["de"],
-            "s_FCF": weighted_scores["fcf_yield"],
-            "s_OpM": weighted_scores["op_margin"],
-            "s_EPS": weighted_scores["eps_growth"],
-            "s_Rev": weighted_scores["rev_growth"],
-            "m_PE": max_weights["pe"],
-            "m_PEG": max_weights["peg"],
-            "m_PB": max_weights["pb"],
-            "m_ROE": max_weights["roe"],
-            "m_ROA": max_weights["roa"],
-            "m_DE": max_weights["de"],
-            "m_FCF": max_weights["fcf_yield"],
-            "m_OpM": max_weights["op_margin"],
-            "m_EPS": max_weights["eps_growth"],
-            "m_Rev": max_weights["rev_growth"],
-        }
-        results.append(result)
-    
-    return pd.DataFrame(results)
+    end = now_ist().date() + timedelta(days=1)
+    data = yf.download(
+        yf_tickers,
+        start=start.isoformat(),
+        end=end.isoformat(),
+        progress=False,
+        auto_adjust=False,
+        threads=True,
+    )
+    if data is None or data.empty:
+        return pd.DataFrame()
+    if isinstance(data.columns, pd.MultiIndex):
+        closes = data["Close"]
+    else:
+        closes = data[["Close"]].rename(columns={"Close": yf_tickers[0]})
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame(yf_tickers[0])
+    closes.index = pd.to_datetime(closes.index).date
+    return closes
+
+
+def period_return(series: pd.Series, ref_date: date) -> dict[str, Any] | None:
+    """Return from the last close on/before `ref_date` to the latest close."""
+    s = series.dropna()
+    if s.empty:
+        return None
+    before = s[[d <= ref_date for d in s.index]]
+    if before.empty:
+        return None
+    start_date, start_px = before.index[-1], float(before.iloc[-1])
+    end_date, end_px = s.index[-1], float(s.iloc[-1])
+    if start_px <= 0:
+        return None
+    return {
+        "start_date": start_date,
+        "start_price": start_px,
+        "end_date": end_date,
+        "end_price": end_px,
+        "return_pct": (end_px - start_px) / start_px * 100,
+    }
