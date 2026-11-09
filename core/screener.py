@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import math
+import random
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -420,10 +421,39 @@ FUNDAMENTAL_FIELDS = [
 ]
 
 
-def _fetch_once(yf_ticker: str) -> dict[str, Any]:
+class RequestPacer:
+    """Spaces out Yahoo Finance requests: one at a time, with a planned gap after each.
+
+    Used as a context manager around every request. The gap is `gap` seconds plus
+    a random 0..`jitter` seconds, counted from the end of the previous request.
+    """
+
+    def __init__(self, gap: float = 1.0, jitter: float = 0.5):
+        self.gap = max(gap, 0.0)
+        self.jitter = max(jitter, 0.0)
+        self._lock = threading.Lock()
+        self._next_start = 0.0
+
+    def __enter__(self) -> "RequestPacer":
+        self._lock.acquire()
+        delay = self._next_start - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._next_start = time.monotonic() + self.gap + random.uniform(0, self.jitter)
+        self._lock.release()
+
+
+NO_PACING = RequestPacer(gap=0, jitter=0)
+
+
+def _fetch_once(yf_ticker: str, pacer: RequestPacer) -> dict[str, Any]:
     t = yf.Ticker(yf_ticker)  # a fresh object: yfinance caches a failed fetch on the instance
     try:
-        info = t.info or {}
+        with pacer:
+            info = t.info or {}
     except Exception as err:
         raise classify_error(err) from err
 
@@ -435,7 +465,8 @@ def _fetch_once(yf_ticker: str) -> dict[str, Any]:
     price = to_number(info.get("currentPrice")) or to_number(info.get("regularMarketPrice"))
     if price is None:
         try:
-            price = to_number(getattr(t.fast_info, "last_price", None))
+            with pacer:
+                price = to_number(getattr(t.fast_info, "last_price", None))
         except Exception:
             price = None
     if price is None or price <= 0:
@@ -448,20 +479,30 @@ def _fetch_once(yf_ticker: str) -> dict[str, Any]:
     return record
 
 
-def fetch_fundamentals(yf_ticker: str, attempts: int = 3, base_delay: float = 2.0) -> dict[str, Any]:
+def fetch_fundamentals(
+    yf_ticker: str,
+    attempts: int = 3,
+    base_delay: float = 2.0,
+    pacer: RequestPacer = NO_PACING,
+) -> dict[str, Any]:
     """Fetch raw fundamentals for one ticker, retrying transient failures.
 
     Raises FetchError with a readable reason and kind.
     """
     for attempt in range(attempts):
         try:
-            return _fetch_once(yf_ticker)
+            return _fetch_once(yf_ticker, pacer)
         except FetchError as err:
             if err.kind not in RETRYABLE or attempt == attempts - 1:
                 raise
             factor = 3 if err.kind == "throttled" else 1
             time.sleep(base_delay * (2 ** attempt) * factor)
     raise AssertionError("unreachable")
+
+
+def estimate_download_seconds(n_stocks: int, request_gap: float, request_jitter: float = 0.5) -> float:
+    """Rough duration: each stock is about one second of Yahoo response time plus the planned gap."""
+    return n_stocks * (1.0 + request_gap + request_jitter / 2)
 
 
 THROTTLE_ABORT_MESSAGE = (
@@ -474,16 +515,19 @@ def fetch_and_cache_base_data(
     stocks: list[tuple[str, str, str]],
     cache_path: str | Path,
     progress_callback: Callable[[int, int, str], None] | None = None,
-    max_workers: int = 2,
-    pause_between: float = 0.5,
+    request_gap: float = 1.0,
+    request_jitter: float = 0.5,
+    max_workers: int = 1,
     throttle_limit: int = 5,
     cooldown_seconds: float = 60.0,
     max_cooldowns: int = 2,
 ) -> tuple[pd.DataFrame, list[dict[str, str]], str | None]:
     """Fetch fundamentals for `stocks` and upsert them into the cache.
 
-    When Yahoo throttles (`throttle_limit` throttled stocks in a row) all workers
-    pause for `cooldown_seconds`; after `max_cooldowns` pauses the download stops.
+    Requests go to Yahoo one at a time with a planned gap of `request_gap` seconds
+    (plus up to `request_jitter` seconds of random jitter) after each one. When
+    Yahoo throttles anyway (`throttle_limit` throttled stocks in a row) the
+    download pauses for `cooldown_seconds`; after `max_cooldowns` pauses it stops.
 
     Returns (updated cache, failures, abort_reason). Stocks that fail keep any
     older cached row; the failure list says so.
@@ -494,6 +538,7 @@ def fetch_and_cache_base_data(
     failures: list[dict[str, str]] = []
     total = len(stocks)
 
+    pacer = RequestPacer(request_gap, request_jitter)
     lock = threading.Lock()
     stop = threading.Event()
     state = {"streak": 0, "cooldowns": 0, "resume_at": 0.0}
@@ -511,7 +556,7 @@ def fetch_and_cache_base_data(
             if stop.is_set():
                 raise FetchError(THROTTLE_ABORT_MESSAGE, "skipped")
             try:
-                row = fetch_fundamentals(yf_t)
+                row = fetch_fundamentals(yf_t, pacer=pacer)
             except FetchError as err:
                 if err.kind != "throttled":
                     raise
@@ -530,7 +575,6 @@ def fetch_and_cache_base_data(
                 raise
             with lock:
                 state["streak"] = 0
-            time.sleep(pause_between)
             return row
 
     retry_later: list[tuple[str, str, str]] = []

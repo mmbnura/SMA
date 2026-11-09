@@ -7,6 +7,7 @@ from core.scan_history import init_db, save_scan_run
 from core.screener import (
     cache_age_summary,
     check_yahoo_reachable,
+    estimate_download_seconds,
     fetch_and_cache_base_data,
     load_base_cache,
     run_scan,
@@ -76,6 +77,12 @@ with st.sidebar:
         min_value=0, max_value=24 * 30, value=24, step=6,
         help="Run Scan re-downloads in-scope stocks whose cached data is older than this. 0 = always re-download.",
     )
+    request_gap = st.number_input(
+        "Gap between Yahoo requests (seconds)",
+        min_value=0.5, max_value=10.0, value=1.0, step=0.5,
+        help="Requests are sent one at a time, with this pause (plus up to 0.5 s of random jitter) "
+             "after each one. Increase it if Yahoo Finance starts rate-limiting.",
+    )
     cache = load_base_cache(BASE_DATA_PATH)
     summary = cache_age_summary(cache, scope_bases)
     need = tickers_needing_fetch(cache, scope_bases, max_age)
@@ -86,7 +93,11 @@ with st.sidebar:
         st.caption(f"Oldest cached data: {oldest:%d %b %Y %H:%M} IST ({format_age(oldest)}).")
     if summary["undated"]:
         st.caption(f"{len(summary['undated'])} cached rows have no download time and will be re-downloaded.")
-    st.caption(f"Run Scan will download {len(need)} stock(s).")
+    if need:
+        minutes = estimate_download_seconds(len(need), request_gap) / 60
+        st.caption(f"Run Scan will download {len(need)} stock(s), roughly {minutes:.0f} min.")
+    else:
+        st.caption("Run Scan will use cached data only.")
 
     scan_btn = st.button("Run Scan", type="primary", width="stretch", disabled=not scope)
     refresh_all = st.button(
@@ -132,13 +143,17 @@ if scan_btn or refresh_all:
                 for t, n, s in fetch_list
             ]
         else:
-            prog = st.progress(0.0, text=f"Downloading fundamentals for {len(fetch_list)} stocks from Yahoo Finance...")
+            prog = st.progress(
+                0.0,
+                text=f"Downloading fundamentals for {len(fetch_list)} stocks from Yahoo Finance, one at a time "
+                     f"with a {request_gap:g} s gap...",
+            )
 
             def on_progress(done: int, total: int, name: str) -> None:
                 prog.progress(done / total, text=f"Downloaded {done}/{total} — {name}")
 
             cache, failures, abort_reason = fetch_and_cache_base_data(
-                fetch_list, BASE_DATA_PATH, progress_callback=on_progress
+                fetch_list, BASE_DATA_PATH, progress_callback=on_progress, request_gap=request_gap
             )
             prog.empty()
 
