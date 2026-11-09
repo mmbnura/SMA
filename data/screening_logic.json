@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "metrics": [
     {
       "id": "pe",
@@ -59,14 +59,14 @@
     },
     {
       "id": "eps_growth",
-      "label": "EPS Growth",
+      "label": "Earnings Growth",
       "enabled": true,
       "weight": 10.0,
       "base_max": 10.0
     },
     {
       "id": "rev_growth",
-      "label": "Rev Growth",
+      "label": "Revenue Growth",
       "enabled": true,
       "weight": 7.0,
       "base_max": 7.0
@@ -76,5 +76,6 @@
     "strong_buy": 75,
     "buy": 60,
     "hold": 45
-  }
+  },
+  "min_data_coverage": 70
 }

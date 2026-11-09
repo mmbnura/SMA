@@ -1,171 +1,121 @@
 ﻿def run():
     import pandas as pd
     import streamlit as st
-    
-    from core.scan_history import get_scan_run, init_db, list_scan_runs, load_scan_results
-    
-    DISPLAY_COLS = [
-        "Ticker",
-        "Name",
-        "Sector",
-        "Price (Rs)",
-        "Cap Bucket",
-        "Score",
-        "Recommendation",
-        "P/E",
-        "PEG",
-        "P/B",
-        "ROE",
-        "ROA",
-        "D/E",
-        "FCF Yield",
-        "Op Margin",
-        "EPS Growth",
-        "Rev Growth",
-        "52W Position",
-    ]
-    
-    
-    def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-        if "Price (Rs)" not in df.columns:
-            for legacy_col in ["Price (₹)", "Price (â‚¹)"]:
-                if legacy_col in df.columns:
-                    df = df.rename(columns={legacy_col: "Price (Rs)"})
-                    break
 
-        for col in DISPLAY_COLS:
-            if col not in df.columns:
-                df[col] = pd.NA
-        return df
-    
-    
-    st.set_page_config(
-        page_title="BAC SMA - History",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    
-    st.markdown(
-        """
-    <style>
-    [data-testid="stSidebarNav"] {
-        display: none;
-    }
-    </style>
-    """,
-        unsafe_allow_html=True,
-    )
-    
+    from core.scan_history import delete_scan_run, get_scan_run, init_db, list_scan_runs, load_scan_results
+    from core.timeutil import parse_timestamp
+    from screens.components import page_setup, render_results, result_filters, sidebar_disclaimer, styled
+
+    def fmt_created(value) -> str:
+        ts = parse_timestamp(value)
+        return f"{ts:%d %b %Y %H:%M}" if ts else str(value)
+
+    page_setup("History", "Scan history")
     init_db()
-    
-    with st.sidebar:
-        st.title("BAC SMA")
-        st.caption("Scan History")
-        st.page_link("app.py", label="Screener")
-        st.page_link("pages/History.py", label="History")
-        st.page_link("pages/Screening_Logic.py", label="Screening Logic")
+
     st.title("Scan History")
-    st.caption("Browse previous scans saved in the local database.")
-    
-    history_df = list_scan_runs(limit=500)
-    if history_df.empty:
-        st.info("No scan history found yet. Run a scan from the Screener page first.")
+    st.caption("Every completed scan is stored locally. Select a scan to review it.")
+
+    history = list_scan_runs(limit=500)
+    if history.empty:
+        st.info("No scans yet. Run a scan from the Screener page first.")
+        sidebar_disclaimer()
         st.stop()
-    
-    list_df = history_df[
-        ["scan_id", "scan_type", "created_at", "total_scored", "total_in_scope", "sector_count"]
-    ].rename(
-        columns={
-            "scan_id": "Scan ID",
-            "scan_type": "Type",
-            "created_at": "Created At",
-            "total_scored": "Scored",
-            "total_in_scope": "In Scope",
-            "sector_count": "Sector Count",
-        }
-    ).sort_values("Created At", ascending=False)
-    
-    st.subheader("Previous Scans")
-    scan_ids = history_df["scan_id"].tolist()
-    
-    if "history_selected_scan_id" not in st.session_state:
+
+    legacy = history["total_disqualified"].isna()
+    table = pd.DataFrame({
+        "Scan ID": history["scan_id"],
+        "Type": history["scan_type"],
+        "Created At": history["created_at"].map(fmt_created),
+        # Older versions stored the scored count as "in scope", so it is not shown for them.
+        "In Scope": history["total_in_scope"].where(~legacy),
+        "Scored": history["total_scored"],
+        "Disqualified": history["total_disqualified"],
+        "Data Unavailable": history["total_unavailable"],
+        "Sectors": history["sector_count"],
+    })
+
+    scan_ids = table["Scan ID"].tolist()
+    if st.session_state.get("history_selected_scan_id") not in scan_ids:
         st.session_state.history_selected_scan_id = scan_ids[0]
-    elif st.session_state.history_selected_scan_id not in scan_ids:
-        st.session_state.history_selected_scan_id = scan_ids[0]
-    
-    selected_scan_id = st.session_state.history_selected_scan_id
-    
-    try:
-        table_event = st.dataframe(
-            list_df,
-            use_container_width=True,
-            hide_index=True,
-            height=300,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="history_scan_table",
-        )
-        selected_rows = table_event.selection.rows if table_event and table_event.selection else []
-        if selected_rows:
-            selected_scan_id = list_df.iloc[selected_rows[0]]["Scan ID"]
-            st.session_state.history_selected_scan_id = selected_scan_id
-    except TypeError:
-        st.dataframe(list_df, use_container_width=True, hide_index=True, height=300)
-        selected_scan_id = st.selectbox(
-            "Select a scan",
-            scan_ids,
-            index=scan_ids.index(st.session_state.history_selected_scan_id),
-        )
-        st.session_state.history_selected_scan_id = selected_scan_id
-    
-    meta = get_scan_run(selected_scan_id)
-    results_df = normalize_columns(load_scan_results(selected_scan_id))
-    
-    if meta:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Scan Type", meta["scan_type"])
-        c2.metric("Created At", meta["created_at"])
-        c3.metric("Scored", int(meta["total_scored"]))
-        c4.metric("In Scope", int(meta["total_in_scope"]))
-        if meta["selected_sectors"]:
-            st.caption("Sectors: " + ", ".join(meta["selected_sectors"]))
-    
+
+    event = st.dataframe(
+        styled(table, missing_text="Not recorded"),
+        width="stretch",
+        hide_index=True,
+        height=300,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="history_scan_table",
+    )
+    if event and event.selection and event.selection.rows:
+        st.session_state.history_selected_scan_id = table.iloc[event.selection.rows[0]]["Scan ID"]
+    selected = st.session_state.history_selected_scan_id
+
+    meta = get_scan_run(selected)
+    if not meta:
+        st.error(f"Scan {selected} could not be loaded.")
+        st.stop()
+    results = load_scan_results(selected)
+
     st.divider()
-    st.subheader(f"Results for {selected_scan_id}")
-    
-    if results_df.empty:
+    st.subheader(f"Scan {selected}")
+    c = st.columns(4)
+    c[0].metric("Type", meta["scan_type"])
+    c[1].metric("Created", fmt_created(meta["created_at"]))
+    c[2].metric("Scored", int(meta["total_scored"]))
+    c[3].metric("Sectors", len(meta["selected_sectors"]))
+    if meta["selected_sectors"]:
+        with st.expander("Sectors in this scan"):
+            st.write(", ".join(meta["selected_sectors"]))
+
+    if meta["is_legacy"]:
+        st.warning(
+            "This scan was saved by an earlier version of the app. That version scored missing data as 0 points, "
+            "gave financial-sector stocks an assumed D/E score, did not record disqualified stocks or download "
+            "failures, and did not record which settings were used. Its scores are not directly comparable with "
+            "newer scans."
+        )
+
+    a, b, _ = st.columns([1, 1, 2])
+    with a:
+        if st.button("Verify accuracy", type="primary", width="stretch"):
+            st.session_state.accuracy_scan_id = selected
+            st.switch_page("pages/Accuracy_Verification.py")
+    with b:
+        if st.button("Delete this scan", width="stretch"):
+            st.session_state.confirm_delete = selected
+    if st.session_state.get("confirm_delete") == selected:
+        st.warning(f"Permanently delete scan {selected}?")
+        y, n, _ = st.columns([1, 1, 4])
+        if y.button("Yes, delete"):
+            delete_scan_run(selected)
+            st.session_state.pop("confirm_delete", None)
+            st.session_state.pop("history_selected_scan_id", None)
+            st.rerun()
+        if n.button("Cancel"):
+            st.session_state.pop("confirm_delete", None)
+            st.rerun()
+
+    if results.empty and meta["disqualified"].empty:
         st.warning("This scan has no saved stock results.")
     else:
-        min_score = st.slider("Min Score", 0, 100, 0, step=5, key="hist_min_score")
-        rec_filter = st.multiselect(
-            "Recommendation",
-            ["Strong Buy", "Buy", "Hold", "Avoid"],
-            default=["Strong Buy", "Buy", "Hold", "Avoid"],
-            key="hist_rec_filter",
+        with st.sidebar:
+            st.subheader("Result filters")
+            min_score, rec_filter = result_filters("hist")
+        render_results(
+            results,
+            meta["disqualified"],
+            meta["unavailable"],
+            None if meta["is_legacy"] else meta["total_in_scope"],
+            meta["config"],
+            min_score,
+            rec_filter,
+            key_prefix=f"hist_{selected}",
         )
-        filtered_df = results_df[
-            (results_df["Score"] >= min_score) & (results_df["Recommendation"].isin(rec_filter))
-        ].sort_values("Score", ascending=False)
-    
-        st.dataframe(
-            filtered_df[DISPLAY_COLS],
-            use_container_width=True,
-            hide_index=True,
-            height=600,
-            column_config={
-                "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100),
-                "52W Position": st.column_config.ProgressColumn(
-                    "52W Position", min_value=0, max_value=100, format="%.0f%%"
-                ),
-                "Price (Rs)": st.column_config.NumberColumn("Price (Rs)", format="%.2f"),
-            },
-        )
-    
-        if st.button("Verify Accuracy", use_container_width=True):
-            st.session_state.accuracy_scan_id = selected_scan_id
-            st.switch_page("pages/Accuracy_Verification.py")
-    
 
-if __name__ == '__main__':
+    sidebar_disclaimer()
+
+
+if __name__ == "__main__":
     run()
-

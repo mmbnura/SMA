@@ -1,9 +1,9 @@
 ﻿def run():
     import json
-    
+
     import pandas as pd
     import streamlit as st
-    
+
     from core.screening_logic import (
         METRIC_DEFINITIONS,
         SCREENING_CONFIG_PATH,
@@ -11,221 +11,132 @@
         load_screening_config,
         metric_lookup,
         save_screening_config,
+        validate_thresholds,
     )
-    
-    
-    def _build_updated_config() -> dict:
-        current = load_screening_config()
-        current_lookup = metric_lookup(current)
-    
-        updated_metrics = []
+    from screens.components import page_setup, sidebar_disclaimer
+
+    page_setup("Screening Logic", "Screening logic")
+
+    def seed(config: dict) -> None:
+        lookup = metric_lookup(config)
         for metric in METRIC_DEFINITIONS:
-            metric_id = metric["id"]
-            metric_state = current_lookup.get(metric_id, {})
-            updated_metrics.append(
-                {
-                    "id": metric_id,
-                    "label": metric["label"],
-                    "enabled": st.session_state.get(f"logic_enabled_{metric_id}", metric_state.get("enabled", True)),
-                    "weight": float(
-                        st.session_state.get(
-                            f"logic_weight_{metric_id}",
-                            metric_state.get("weight", float(metric["base_max"])),
-                        )
-                    ),
-                    "base_max": float(metric["base_max"]),
-                }
-            )
-    
-        return {
-            "version": current.get("version", 1),
-            "metrics": updated_metrics,
-            "recommendation_thresholds": current.get("recommendation_thresholds", {}),
-        }
-    
-    
-    def _seed_widgets_from_config(config: dict) -> None:
-        config_lookup = metric_lookup(config)
-        for metric in METRIC_DEFINITIONS:
-            metric_id = metric["id"]
-            item = config_lookup.get(metric_id, {})
-            st.session_state[f"logic_enabled_{metric_id}"] = bool(item.get("enabled", True))
-            st.session_state[f"logic_weight_{metric_id}"] = float(item.get("weight", float(metric["base_max"])))
-            st.session_state[f"logic_select_{metric_id}"] = False
-    
-    
-    st.set_page_config(
-        page_title="BAC SMA - Screening Logic",
-        layout="wide",
-        initial_sidebar_state="expanded",
+            item = lookup.get(metric["id"], {})
+            st.session_state[f"logic_enabled_{metric['id']}"] = bool(item.get("enabled", True))
+            st.session_state[f"logic_weight_{metric['id']}"] = float(item.get("weight", metric["base_max"]))
+        for key, value in config["recommendation_thresholds"].items():
+            st.session_state[f"logic_thr_{key}"] = int(value)
+        st.session_state["logic_min_cov"] = int(config["min_data_coverage"])
+        st.session_state.logic_seeded = True
+
+    # Streamlit drops widget keys after navigating to another page, so re-seed if any are gone.
+    widget_keys = [f"logic_{kind}_{m['id']}" for m in METRIC_DEFINITIONS for kind in ("enabled", "weight")]
+    widget_keys += ["logic_thr_strong_buy", "logic_thr_buy", "logic_thr_hold", "logic_min_cov"]
+    if not st.session_state.get("logic_seeded") or any(k not in st.session_state for k in widget_keys):
+        seed(load_screening_config())
+
+    st.title("Screening Logic")
+    st.caption(
+        "Weights are relative: the final score is points earned divided by the weight of the metrics that have data, "
+        "scaled to 100. Changes apply to the next scan; saved scans keep the settings they were run with."
     )
-    
-    st.markdown(
-        """
-    <style>
-    [data-testid="stSidebarNav"] {
-        display: none;
-    }
-    </style>
-    """,
-        unsafe_allow_html=True,
+    if st.session_state.pop("logic_flash", None):
+        st.success(st.session_state.pop("logic_flash_msg", "Saved."))
+
+    st.subheader("Metrics")
+    header = st.columns([2.2, 1, 1.4, 1.2, 1])
+    for col, text in zip(header, ["Metric", "Enabled", "Weight", "Share of score", "Default"]):
+        col.markdown(f"**{text}**")
+
+    total = sum(
+        st.session_state[f"logic_weight_{m['id']}"]
+        for m in METRIC_DEFINITIONS
+        if st.session_state[f"logic_enabled_{m['id']}"]
     )
-    
-    with st.sidebar:
-        st.title("BAC SMA")
-        st.caption("Screening Logic")
-        st.page_link("app.py", label="Screener")
-        st.page_link("pages/History.py", label="History")
-        st.page_link("pages/Screening_Logic.py", label="Screening Logic")
-    
-    current_config = load_screening_config()
-    
-    if "logic_widgets_seeded" not in st.session_state:
-        _seed_widgets_from_config(current_config)
-        st.session_state.logic_widgets_seeded = True
-    
-    st.title("Screening Logic Settings")
-    st.caption("Select rows to edit parameters, adjust weights, and enable/disable metrics. Settings are saved to JSON.")
-    if st.session_state.pop("logic_reset_done", False):
-        st.success("Default screening logic restored.")
-    
-    # Build table data
-    config_lookup = metric_lookup(current_config)
-    table_data = []
     for metric in METRIC_DEFINITIONS:
-        metric_id = metric["id"]
-        item = config_lookup.get(metric_id, {})
-        table_data.append({
-            "metric_id": metric_id,
-            "Parameter": metric["label"],
-            "Default Value": f"{metric['base_max']}",
-            "Current Weight": float(item.get("weight", float(metric["base_max"]))),
-            "Explanation": metric.get('description', 'N/A'),
-            "Good Range": metric.get('good_range', 'N/A'),
-            "Enabled": bool(item.get("enabled", True)),
-        })
-    
-    st.subheader("Parameters Table")
-    
-    # Display table with selection and editing
-    col_select, col_param, col_default, col_weight, col_enabled = st.columns([0.5, 1.5, 1, 1.5, 1])
-    
-    with col_select:
-        st.write("**Select**")
-    with col_param:
-        st.write("**Parameter**")
-    with col_default:
-        st.write("**Default**")
-    with col_weight:
-        st.write("**Current Weight**")
-    with col_enabled:
-        st.write("**Enabled**")
-    
+        mid = metric["id"]
+        row = st.columns([2.2, 1, 1.4, 1.2, 1])
+        with row[0]:
+            st.markdown(f"**{metric['label']}**", help=f"{metric['description']}\n\nScoring: {metric['good_range']}\n\nSource: {metric['source']}")
+        row[1].checkbox("Enabled", key=f"logic_enabled_{mid}", label_visibility="collapsed")
+        row[2].number_input(
+            "Weight", min_value=0.0, max_value=100.0, step=0.5,
+            key=f"logic_weight_{mid}", label_visibility="collapsed",
+        )
+        enabled = st.session_state[f"logic_enabled_{mid}"]
+        weight = st.session_state[f"logic_weight_{mid}"]
+        share = weight / total * 100 if enabled and total > 0 else 0
+        row[3].write(f"{share:.1f}%" if enabled else "Disabled")
+        row[4].write(f"{metric['base_max']:g}")
+
+    if total <= 0:
+        st.error("All metrics are disabled or have zero weight. Every stock would be rated Insufficient Data.")
+
+    with st.expander("How each metric is scored and where the data comes from"):
+        st.dataframe(
+            pd.DataFrame([
+                {"Metric": m["label"], "Scoring": m["good_range"], "Source": m["source"], "Description": m["description"]}
+                for m in METRIC_DEFINITIONS
+            ]),
+            width="stretch", hide_index=True,
+        )
+
+    st.subheader("Recommendation thresholds")
+    t = st.columns(3)
+    t[0].number_input("Strong Buy at or above", 0, 100, step=1, key="logic_thr_strong_buy")
+    t[1].number_input("Buy at or above", 0, 100, step=1, key="logic_thr_buy")
+    t[2].number_input("Hold at or above", 0, 100, step=1, key="logic_thr_hold")
+    thresholds = {k: st.session_state[f"logic_thr_{k}"] for k in ("strong_buy", "buy", "hold")}
+    _, thr_error = validate_thresholds(thresholds)
+    if thr_error:
+        st.error(thr_error)
+    else:
+        st.caption(f"Scores below {thresholds['hold']} are rated Avoid.")
+
+    st.subheader("Minimum data coverage")
+    st.slider(
+        "Rate a stock only if at least this share of the scoring weight has real data (%)",
+        0, 100, step=5, key="logic_min_cov",
+    )
+    st.caption(
+        "Stocks below this coverage are labelled 'Insufficient Data' instead of receiving a recommendation. "
+        "Their partial score is still shown."
+    )
+
     st.divider()
-    
-    for row in table_data:
-        metric_id = row["metric_id"]
-        col_select, col_param, col_default, col_weight, col_enabled = st.columns([0.5, 1.5, 1, 1.5, 1])
-        
-        with col_select:
-            st.checkbox(
-                "Select",
-                key=f"logic_select_{metric_id}",
-                label_visibility="collapsed"
-            )
-        
-        with col_param:
-            st.write(row["Parameter"])
-        
-        with col_default:
-            st.write(row["Default Value"])
-        
-        with col_weight:
-            st.number_input(
-                "Weight",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.5,
-                key=f"logic_weight_{metric_id}",
-                label_visibility="collapsed",
-            )
-        
-        with col_enabled:
-            st.checkbox(
-                "Enabled",
-                key=f"logic_enabled_{metric_id}",
-                label_visibility="collapsed"
-            )
-    
-    st.divider()
-    
-    # Show details for selected rows
-    selected_metrics = [
-        row for row in table_data 
-        if st.session_state.get(f"logic_select_{row['metric_id']}", False)
-    ]
-    
-    if selected_metrics:
-        st.subheader(f"Edit Selected Rows ({len(selected_metrics)} selected)")
-        
-        for row in selected_metrics:
-            metric_id = row["metric_id"]
-            with st.expander(f"📝 {row['Parameter']}"):
-                st.write(f"**Explanation:** {row['Explanation']}")
-                st.write(f"**Good Range:** {row['Good Range']}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    new_weight = st.number_input(
-                        f"Update Weight for {row['Parameter']}",
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.5,
-                        value=st.session_state.get(f"logic_weight_{metric_id}", row["Current Weight"]),
-                        key=f"edit_weight_{metric_id}",
-                        help="Higher weight gives this metric more influence in the final score."
-                    )
-                    # Sync back to main table
-                    st.session_state[f"logic_weight_{metric_id}"] = new_weight
-                
-                with col2:
-                    enabled = st.checkbox(
-                        f"Enable {row['Parameter']}",
-                        value=st.session_state.get(f"logic_enabled_{metric_id}", row["Enabled"]),
-                        key=f"edit_enabled_{metric_id}",
-                    )
-                    # Sync back to main table
-                    st.session_state[f"logic_enabled_{metric_id}"] = enabled
-    
-    st.divider()
-    
-    # Action buttons
-    btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 2])
-    
-    with btn_col1:
-        if st.button("💾 Save Screening Logic", type="primary", use_container_width=True):
-            save_screening_config(_build_updated_config())
-            st.success(f"✅ Saved to {SCREENING_CONFIG_PATH.name}")
-    
-    with btn_col2:
-        if st.button("🔄 Reset to Default", use_container_width=True):
+    b = st.columns(2)
+    with b[0]:
+        if st.button("Save", type="primary", width="stretch", disabled=bool(thr_error)):
+            config = {
+                "metrics": [
+                    {
+                        "id": m["id"],
+                        "enabled": st.session_state[f"logic_enabled_{m['id']}"],
+                        "weight": st.session_state[f"logic_weight_{m['id']}"],
+                    }
+                    for m in METRIC_DEFINITIONS
+                ],
+                "recommendation_thresholds": thresholds,
+                "min_data_coverage": st.session_state["logic_min_cov"],
+            }
+            save_screening_config(config)
+            st.session_state.logic_flash = True
+            st.session_state.logic_flash_msg = f"Saved to {SCREENING_CONFIG_PATH.name}."
+            st.session_state.logic_seeded = False
+            st.rerun()
+    with b[1]:
+        if st.button("Reset to defaults", width="stretch"):
             save_screening_config(get_default_config())
-            st.session_state.logic_widgets_seeded = False
-            st.session_state.logic_reset_done = True
+            st.session_state.logic_flash = True
+            st.session_state.logic_flash_msg = "Default screening logic restored."
+            st.session_state.logic_seeded = False
             st.rerun()
-    
-    with btn_col3:
-        if st.button("✨ Clear Selection", use_container_width=True):
-            for metric in METRIC_DEFINITIONS:
-                st.session_state[f"logic_select_{metric['id']}"] = False
-            st.rerun()
-    
-    st.subheader("Current Configuration (JSON)")
-    st.caption(f"Path: {SCREENING_CONFIG_PATH}")
-    st.code(json.dumps(load_screening_config(), indent=2), language="json")
-    
-    
 
-if __name__ == '__main__':
+    with st.expander("Saved configuration (JSON)"):
+        st.caption(f"Path: {SCREENING_CONFIG_PATH}")
+        st.code(json.dumps(load_screening_config(), indent=2), language="json")
+
+    sidebar_disclaimer()
+
+
+if __name__ == "__main__":
     run()
-
