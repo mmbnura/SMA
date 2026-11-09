@@ -1,5 +1,6 @@
 ﻿from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from core.scan_history import init_db, save_scan_run
@@ -117,6 +118,7 @@ if scan_btn or refresh_all:
     to_fetch = scope_bases if refresh_all else need
     failures = []
     download_error = None
+    abort_reason = None
     if to_fetch:
         fetch_set = set(to_fetch)
         fetch_list = [s for s in scope if s[0].replace(".NS", "") in fetch_set]
@@ -135,7 +137,9 @@ if scan_btn or refresh_all:
             def on_progress(done: int, total: int, name: str) -> None:
                 prog.progress(done / total, text=f"Downloaded {done}/{total} — {name}")
 
-            cache, failures = fetch_and_cache_base_data(fetch_list, BASE_DATA_PATH, progress_callback=on_progress)
+            cache, failures, abort_reason = fetch_and_cache_base_data(
+                fetch_list, BASE_DATA_PATH, progress_callback=on_progress
+            )
             prog.empty()
 
     config = load_screening_config()
@@ -162,6 +166,7 @@ if scan_btn or refresh_all:
         "failures": failures,
         "fetched": len(to_fetch),
         "download_error": download_error,
+        "abort_reason": abort_reason,
     }
     st.rerun()
 
@@ -173,6 +178,8 @@ if scan:
             f"{scan['download_error']} No data was downloaded; this scan used only previously cached data. "
             "Check each stock's 'Data As Of' column."
         )
+    if scan.get("abort_reason"):
+        st.error(scan["abort_reason"])
     msg = (
         f"Scan **{scan['scan_id']}** — {result.in_scope} in scope: {len(result.scored)} scored, "
         f"{len(result.disqualified)} disqualified, {len(result.unavailable)} without data."
@@ -181,8 +188,18 @@ if scan:
         msg += f" Downloaded {scan['fetched'] - len(scan['failures'])} of {scan['fetched']} requested."
     st.success(msg)
     if scan["failures"]:
-        with st.expander(f"{len(scan['failures'])} download(s) failed — details"):
-            st.dataframe(scan["failures"], width="stretch", hide_index=True)
+        failed = pd.DataFrame(scan["failures"])
+        causes = (
+            failed["Reason"].str.replace(" — older cached data kept", "", regex=False)
+            .value_counts().rename_axis("Reason").reset_index(name="Stocks")
+        )
+        if len(failed) > 0.2 * scan["fetched"]:
+            st.warning(f"{len(failed)} of {scan['fetched']} downloads failed. Most common cause: {causes.iloc[0]['Reason']}")
+        with st.expander(f"{len(failed)} download(s) failed — details"):
+            st.markdown("**By cause**")
+            st.dataframe(causes, width="stretch", hide_index=True)
+            st.markdown("**By stock**")
+            st.dataframe(failed, width="stretch", hide_index=True)
     render_results(
         result.scored,
         result.disqualified,

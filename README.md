@@ -55,7 +55,11 @@ All triggered reasons are listed in the **Excluded** tab.
 - Live Nifty 500 constituents from NSE Indices; if NSE is unreachable the last saved list is used
   and the app says so, with its date.
 - Fundamentals cache (`data/base_data.csv`) updated per stock. **Run Scan** downloads only stocks that
-  are missing or older than the chosen age (default 24 h). Failed downloads keep older data and are listed.
+  are missing or older than the chosen age (default 24 h). Failed downloads keep older data and are listed
+  with Yahoo's actual error (e.g. HTTP 429 rate limit, 401 "Invalid Crumb", 404 symbol not found), grouped by cause.
+- Downloads use 2 parallel requests with a short pause. If Yahoo starts rate-limiting, the download pauses
+  for 60 s (up to twice), retries the affected stocks, and otherwise stops with a clear message instead of
+  marking hundreds of stocks as failed. A full Nifty 500 download takes roughly 5–10 minutes.
 - Tabs: Dashboard (counts, mix, sector averages, score distribution, data availability per metric),
   Screener (sortable table, CSV export), Top Picks, Deep Dive (price chart, per-metric values and points,
   sources), Excluded (disqualified and unavailable stocks).

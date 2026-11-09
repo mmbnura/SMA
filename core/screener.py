@@ -9,8 +9,9 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -337,20 +338,65 @@ def score_stock(raw: dict[str, Any], ticker: str, name: str, sector: str, config
 # BASE DATA: fetch from Yahoo and cache locally (upsert per ticker)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# yfinance's default hides HTTP errors (e.g. 401 "Invalid Crumb", 404) and returns
+# empty data, which makes failures impossible to explain. Make them raise.
+if hasattr(yf, "config"):
+    yf.config.debug.hide_exceptions = False
+
+
 class FetchError(Exception):
-    pass
+    """A download failure with a readable message and a kind used for retry decisions.
+
+    kind: throttled | not_found | network | no_data | no_price | skipped | other
+    """
+
+    def __init__(self, message: str, kind: str = "other"):
+        super().__init__(message)
+        self.kind = kind
 
 
-def _with_retries(fn: Callable[[], Any], attempts: int = 3, base_delay: float = 1.5) -> Any:
-    last_err: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            return fn()
-        except Exception as err:  # yfinance raises many error types
-            last_err = err
-            if attempt < attempts - 1:
-                time.sleep(base_delay * (2 ** attempt))
-    raise last_err  # type: ignore[misc]
+RETRYABLE = {"throttled", "network", "no_data"}
+_TRANSIENT_NAMES = {
+    "Timeout", "TimeoutError", "ConnectionError", "ConnectTimeout", "ReadTimeout",
+    "ChunkedEncodingError", "RemoteDisconnected", "ProxyError", "SSLError",
+}
+
+
+def _yahoo_detail(err: Exception) -> str:
+    """Yahoo's own error description from an HTTP error response, if any."""
+    response = getattr(err, "response", None)
+    try:
+        body = response.json()
+    except Exception:
+        return ""
+    for key in ("finance", "quoteSummary", "quoteResponse"):
+        error = (body.get(key) or {}).get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            return str(error.get("description") or error.get("code") or "")
+    return ""
+
+
+def classify_error(err: Exception) -> FetchError:
+    if isinstance(err, FetchError):
+        return err
+    name = type(err).__name__
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    detail = _yahoo_detail(err)
+    suffix = f": {detail}" if detail else ""
+    if name == "YFRateLimitError" or status == 429:
+        return FetchError("Yahoo Finance is rate-limiting requests (HTTP 429 Too Many Requests)", "throttled")
+    if status in (401, 403):
+        return FetchError(
+            f"Yahoo Finance refused the request (HTTP {status}{suffix}); usually a session or throttling issue",
+            "throttled",
+        )
+    if status == 404:
+        return FetchError(f"Symbol not found on Yahoo Finance (HTTP 404{suffix})", "not_found")
+    if isinstance(status, int) and status >= 500:
+        return FetchError(f"Yahoo Finance server error (HTTP {status}{suffix})", "network")
+    if name in _TRANSIENT_NAMES or isinstance(err, (requests.RequestException, OSError, TimeoutError)):
+        return FetchError(f"Network error while contacting Yahoo Finance ({name})", "network")
+    return FetchError(f"Unexpected error from yfinance ({name}: {str(err)[:200]})", "other")
 
 
 YAHOO_PROBE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=1d&interval=1d"
@@ -365,21 +411,26 @@ def check_yahoo_reachable(timeout: float = 10.0) -> str | None:
         return f"Cannot reach Yahoo Finance ({type(err).__name__}). Check the internet connection or proxy."
 
 
-def fetch_fundamentals(yf_ticker: str) -> dict[str, Any]:
-    """Fetch raw fundamentals for one ticker. Raises FetchError with a readable reason."""
-    t = yf.Ticker(yf_ticker)
-    try:
-        info = _with_retries(lambda: t.info) or {}
-    except Exception as err:
-        raise FetchError(f"Yahoo Finance request failed: {type(err).__name__}: {err}") from err
+# Inputs to the scores and hard filters; if Yahoo returns none of them the
+# response is treated as a failed download rather than cached as empty data.
+FUNDAMENTAL_FIELDS = [
+    "trailingPE", "pegRatio", "trailingPegRatio", "priceToBook", "returnOnEquity", "returnOnAssets",
+    "debtToEquity", "freeCashflow", "operatingMargins", "earningsQuarterlyGrowth", "revenueGrowth",
+    "currentRatio",
+]
 
-    # yfinance returns an (almost) empty dict instead of raising on network errors,
-    # rate limits and unknown symbols, so these cannot be told apart here.
+
+def _fetch_once(yf_ticker: str) -> dict[str, Any]:
+    t = yf.Ticker(yf_ticker)  # a fresh object: yfinance caches a failed fetch on the instance
+    try:
+        info = t.info or {}
+    except Exception as err:
+        raise classify_error(err) from err
+
     if not any(info.get(k) for k in ("symbol", "quoteType", "shortName", "longName")):
-        raise FetchError(
-            "Yahoo Finance returned no data for this symbol (network error, rate limit, "
-            "or the symbol is not available on Yahoo)"
-        )
+        raise FetchError("Yahoo Finance returned an empty response for this symbol", "no_data")
+    if all(to_number(info.get(k)) is None for k in FUNDAMENTAL_FIELDS):
+        raise FetchError("Yahoo Finance returned a quote but no fundamental data", "no_data")
 
     price = to_number(info.get("currentPrice")) or to_number(info.get("regularMarketPrice"))
     if price is None:
@@ -388,12 +439,172 @@ def fetch_fundamentals(yf_ticker: str) -> dict[str, Any]:
         except Exception:
             price = None
     if price is None or price <= 0:
-        raise FetchError("Yahoo Finance returned company data but no current price (trading may be suspended)")
+        raise FetchError("Yahoo Finance returned company data but no current price (trading may be suspended)",
+                         "no_price")
 
     record = {field_name: info.get(field_name) for field_name in YF_FIELDS}
     record["lastPrice"] = price
     record["fetched_at"] = now_ist().isoformat(timespec="seconds")
     return record
+
+
+def fetch_fundamentals(yf_ticker: str, attempts: int = 3, base_delay: float = 2.0) -> dict[str, Any]:
+    """Fetch raw fundamentals for one ticker, retrying transient failures.
+
+    Raises FetchError with a readable reason and kind.
+    """
+    for attempt in range(attempts):
+        try:
+            return _fetch_once(yf_ticker)
+        except FetchError as err:
+            if err.kind not in RETRYABLE or attempt == attempts - 1:
+                raise
+            factor = 3 if err.kind == "throttled" else 1
+            time.sleep(base_delay * (2 ** attempt) * factor)
+    raise AssertionError("unreachable")
+
+
+THROTTLE_ABORT_MESSAGE = (
+    "Not downloaded: Yahoo Finance kept rate-limiting requests, so the download was stopped. "
+    "Wait a few minutes and run the scan again."
+)
+
+
+def fetch_and_cache_base_data(
+    stocks: list[tuple[str, str, str]],
+    cache_path: str | Path,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    max_workers: int = 2,
+    pause_between: float = 0.5,
+    throttle_limit: int = 5,
+    cooldown_seconds: float = 60.0,
+    max_cooldowns: int = 2,
+) -> tuple[pd.DataFrame, list[dict[str, str]], str | None]:
+    """Fetch fundamentals for `stocks` and upsert them into the cache.
+
+    When Yahoo throttles (`throttle_limit` throttled stocks in a row) all workers
+    pause for `cooldown_seconds`; after `max_cooldowns` pauses the download stops.
+
+    Returns (updated cache, failures, abort_reason). Stocks that fail keep any
+    older cached row; the failure list says so.
+    """
+    cache = load_base_cache(cache_path)
+    cached_tickers = set(cache["Ticker"])
+    fetched: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    total = len(stocks)
+
+    lock = threading.Lock()
+    stop = threading.Event()
+    state = {"streak": 0, "cooldowns": 0, "resume_at": 0.0}
+
+    def wait_for_resume() -> None:
+        while not stop.is_set():
+            remaining = state["resume_at"] - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 1.0))
+
+    def task(yf_t: str) -> dict[str, Any]:
+        while True:
+            wait_for_resume()
+            if stop.is_set():
+                raise FetchError(THROTTLE_ABORT_MESSAGE, "skipped")
+            try:
+                row = fetch_fundamentals(yf_t)
+            except FetchError as err:
+                if err.kind != "throttled":
+                    raise
+                with lock:
+                    state["streak"] += 1
+                    if state["streak"] >= throttle_limit:
+                        state["streak"] = 0
+                        if state["cooldowns"] >= max_cooldowns:
+                            stop.set()
+                        else:
+                            state["cooldowns"] += 1
+                            state["resume_at"] = time.time() + cooldown_seconds
+                    retry = state["resume_at"] > time.time()
+                if retry:
+                    continue  # try this stock again after the pause
+                raise
+            with lock:
+                state["streak"] = 0
+            time.sleep(pause_between)
+            return row
+
+    retry_later: list[tuple[str, str, str]] = []
+    done_count = 0
+
+    def record(stock: tuple[str, str, str], row: dict | None, exc: Exception | None, final: bool) -> None:
+        nonlocal done_count
+        yf_t, name, sector = stock
+        base = yf_t.replace(".NS", "")
+        if row is not None:
+            row.update({"Ticker": base, "Name": name, "Sector": sector})
+            fetched.append(row)
+        else:
+            err = classify_error(exc)
+            if err.kind == "throttled" and not final:
+                retry_later.append(stock)
+                return
+            reason = str(err) + (" — older cached data kept" if base in cached_tickers else "")
+            failures.append({"Ticker": base, "Name": name, "Sector": sector, "Reason": reason})
+        done_count += 1
+
+    def report(name: str) -> None:
+        if not progress_callback:
+            return
+        pause = state["resume_at"] - time.time()
+        if pause > 0 and not stop.is_set():
+            progress_callback(done_count, total, f"Yahoo Finance is rate-limiting; pausing {pause:.0f}s")
+        elif name:
+            progress_callback(done_count, total, name)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(task, stock[0]): stock for stock in stocks}
+        pending = set(futures)
+        while pending:
+            finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            last_name = ""
+            for future in finished:
+                stock = futures[future]
+                try:
+                    record(stock, future.result(), None, final=False)
+                except Exception as exc:
+                    record(stock, None, exc, final=False)
+                last_name = stock[1]
+            report(last_name)
+
+    # Stocks throttled before a pause began get one more, sequential attempt.
+    for stock in retry_later:
+        report(f"retrying {stock[1]} after rate limiting")
+        try:
+            row = task(stock[0])
+        except Exception as exc:
+            record(stock, None, exc, final=True)
+        else:
+            record(stock, row, None, final=True)
+        report(stock[1])
+
+    if fetched:
+        new_rows = pd.DataFrame(fetched)[BASE_COLUMNS]
+        refreshed = set(new_rows["Ticker"])
+        cache = pd.concat(
+            [cache[~cache["Ticker"].isin(refreshed)], new_rows], ignore_index=True
+        ) if not cache.empty else new_rows
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cache.to_csv(path, index=False)
+
+    abort_reason = None
+    if stop.is_set():
+        skipped = sum(1 for f in failures if f["Reason"].startswith("Not downloaded"))
+        abort_reason = (
+            f"Yahoo Finance kept rate-limiting requests, so the download stopped early: {len(fetched)} downloaded, "
+            f"{skipped} not attempted. Wait a few minutes and run the scan again; already-downloaded data is kept."
+        )
+    return cache, failures, abort_reason
 
 
 def load_base_cache(path: str | Path) -> pd.DataFrame:
@@ -428,53 +639,6 @@ def tickers_needing_fetch(cache: pd.DataFrame, tickers: list[str], max_age_hours
     cutoff = now_ist() - timedelta(hours=max_age_hours)
     stale = [tk for tk, ts in summary["dated"] if ts < cutoff]
     return summary["missing"] + summary["undated"] + stale
-
-
-def fetch_and_cache_base_data(
-    stocks: list[tuple[str, str, str]],
-    cache_path: str | Path,
-    progress_callback: Callable[[int, int, str], None] | None = None,
-    max_workers: int = 4,
-) -> tuple[pd.DataFrame, list[dict[str, str]]]:
-    """Fetch fundamentals for `stocks` and upsert them into the cache.
-
-    Returns (updated cache, failures). Stocks that fail keep any older cached
-    row; the failure list says so.
-    """
-    cache = load_base_cache(cache_path)
-    cached_tickers = set(cache["Ticker"])
-    fetched: list[dict[str, Any]] = []
-    failures: list[dict[str, str]] = []
-    total = len(stocks)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(fetch_fundamentals, yf_t): (yf_t, n, s) for yf_t, n, s in stocks}
-        for done, future in enumerate(as_completed(futures), start=1):
-            yf_t, name, sector = futures[future]
-            base = yf_t.replace(".NS", "")
-            try:
-                row = future.result()
-                row.update({"Ticker": base, "Name": name, "Sector": sector})
-                fetched.append(row)
-            except Exception as err:
-                reason = str(err) if isinstance(err, FetchError) else f"{type(err).__name__}: {err}"
-                if base in cached_tickers:
-                    reason += " — older cached data kept"
-                failures.append({"Ticker": base, "Name": name, "Sector": sector, "Reason": reason})
-            if progress_callback:
-                progress_callback(done, total, name)
-
-    if fetched:
-        new_rows = pd.DataFrame(fetched)[BASE_COLUMNS]
-        refreshed = set(new_rows["Ticker"])
-        cache = pd.concat(
-            [cache[~cache["Ticker"].isin(refreshed)], new_rows], ignore_index=True
-        ) if not cache.empty else new_rows
-        path = Path(cache_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cache.to_csv(path, index=False)
-
-    return cache, failures
 
 
 # ─────────────────────────────────────────────────────────────────────────────
