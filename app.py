@@ -1,11 +1,13 @@
 ﻿from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from core.scan_history import init_db, save_scan_run
 from core.screener import (
     cache_age_summary,
     check_yahoo_reachable,
+    estimate_download_seconds,
     fetch_and_cache_base_data,
     load_base_cache,
     run_scan,
@@ -75,6 +77,12 @@ with st.sidebar:
         min_value=0, max_value=24 * 30, value=24, step=6,
         help="Run Scan re-downloads in-scope stocks whose cached data is older than this. 0 = always re-download.",
     )
+    request_gap = st.number_input(
+        "Gap between Yahoo requests (seconds)",
+        min_value=0.5, max_value=10.0, value=1.0, step=0.5,
+        help="Requests are sent one at a time, with this pause (plus up to 0.5 s of random jitter) "
+             "after each one. Increase it if Yahoo Finance starts rate-limiting.",
+    )
     cache = load_base_cache(BASE_DATA_PATH)
     summary = cache_age_summary(cache, scope_bases)
     need = tickers_needing_fetch(cache, scope_bases, max_age)
@@ -85,7 +93,11 @@ with st.sidebar:
         st.caption(f"Oldest cached data: {oldest:%d %b %Y %H:%M} IST ({format_age(oldest)}).")
     if summary["undated"]:
         st.caption(f"{len(summary['undated'])} cached rows have no download time and will be re-downloaded.")
-    st.caption(f"Run Scan will download {len(need)} stock(s).")
+    if need:
+        minutes = estimate_download_seconds(len(need), request_gap) / 60
+        st.caption(f"Run Scan will download {len(need)} stock(s), roughly {minutes:.0f} min.")
+    else:
+        st.caption("Run Scan will use cached data only.")
 
     scan_btn = st.button("Run Scan", type="primary", width="stretch", disabled=not scope)
     refresh_all = st.button(
@@ -117,6 +129,7 @@ if scan_btn or refresh_all:
     to_fetch = scope_bases if refresh_all else need
     failures = []
     download_error = None
+    abort_reason = None
     if to_fetch:
         fetch_set = set(to_fetch)
         fetch_list = [s for s in scope if s[0].replace(".NS", "") in fetch_set]
@@ -130,12 +143,18 @@ if scan_btn or refresh_all:
                 for t, n, s in fetch_list
             ]
         else:
-            prog = st.progress(0.0, text=f"Downloading fundamentals for {len(fetch_list)} stocks from Yahoo Finance...")
+            prog = st.progress(
+                0.0,
+                text=f"Downloading fundamentals for {len(fetch_list)} stocks from Yahoo Finance, one at a time "
+                     f"with a {request_gap:g} s gap...",
+            )
 
             def on_progress(done: int, total: int, name: str) -> None:
                 prog.progress(done / total, text=f"Downloaded {done}/{total} — {name}")
 
-            cache, failures = fetch_and_cache_base_data(fetch_list, BASE_DATA_PATH, progress_callback=on_progress)
+            cache, failures, abort_reason = fetch_and_cache_base_data(
+                fetch_list, BASE_DATA_PATH, progress_callback=on_progress, request_gap=request_gap
+            )
             prog.empty()
 
     config = load_screening_config()
@@ -162,6 +181,7 @@ if scan_btn or refresh_all:
         "failures": failures,
         "fetched": len(to_fetch),
         "download_error": download_error,
+        "abort_reason": abort_reason,
     }
     st.rerun()
 
@@ -173,6 +193,8 @@ if scan:
             f"{scan['download_error']} No data was downloaded; this scan used only previously cached data. "
             "Check each stock's 'Data As Of' column."
         )
+    if scan.get("abort_reason"):
+        st.error(scan["abort_reason"])
     msg = (
         f"Scan **{scan['scan_id']}** — {result.in_scope} in scope: {len(result.scored)} scored, "
         f"{len(result.disqualified)} disqualified, {len(result.unavailable)} without data."
@@ -181,8 +203,18 @@ if scan:
         msg += f" Downloaded {scan['fetched'] - len(scan['failures'])} of {scan['fetched']} requested."
     st.success(msg)
     if scan["failures"]:
-        with st.expander(f"{len(scan['failures'])} download(s) failed — details"):
-            st.dataframe(scan["failures"], width="stretch", hide_index=True)
+        failed = pd.DataFrame(scan["failures"])
+        causes = (
+            failed["Reason"].str.replace(" — older cached data kept", "", regex=False)
+            .value_counts().rename_axis("Reason").reset_index(name="Stocks")
+        )
+        if len(failed) > 0.2 * scan["fetched"]:
+            st.warning(f"{len(failed)} of {scan['fetched']} downloads failed. Most common cause: {causes.iloc[0]['Reason']}")
+        with st.expander(f"{len(failed)} download(s) failed — details"):
+            st.markdown("**By cause**")
+            st.dataframe(causes, width="stretch", hide_index=True)
+            st.markdown("**By stock**")
+            st.dataframe(failed, width="stretch", hide_index=True)
     render_results(
         result.scored,
         result.disqualified,

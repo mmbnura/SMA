@@ -187,18 +187,184 @@ def test_fetch_upserts_cache_and_keeps_rows_on_failure(tmp_path, monkeypatch):
         {"Ticker": "FAIL", "Name": "Fail", "Sector": "IT", "trailingPE": 5.0, "fetched_at": "2020-01-01T10:00:00+05:30"},
     ]).to_csv(path, index=False)
 
-    def fake_fetch(yf_ticker):
+    def fake_fetch(yf_ticker, **kwargs):
         if yf_ticker == "FAIL.NS":
             raise FetchError("boom")
         return {**{k: None for k in screener.YF_FIELDS}, "trailingPE": 20.0, "lastPrice": 1.0,
                 "fetched_at": now_ist().isoformat()}
 
     monkeypatch.setattr(screener, "fetch_fundamentals", fake_fetch)
-    cache, failures = fetch_and_cache_base_data(
-        [("OLD.NS", "Old", "IT"), ("NEW.NS", "New", "IT"), ("FAIL.NS", "Fail", "IT")], path
+    cache, failures, aborted = fetch_and_cache_base_data(
+        [("OLD.NS", "Old", "IT"), ("NEW.NS", "New", "IT"), ("FAIL.NS", "Fail", "IT")], path, request_gap=0, request_jitter=0
     )
+    assert aborted is None
     saved = load_base_cache(path).set_index("Ticker")
     assert set(saved.index) == {"OLD", "NEW", "FAIL"}
     assert saved.loc["OLD", "trailingPE"] == 20.0
     assert saved.loc["FAIL", "trailingPE"] == 5.0
     assert failures == [{"Ticker": "FAIL", "Name": "Fail", "Sector": "IT", "Reason": "boom — older cached data kept"}]
+
+
+class _Resp:
+    def __init__(self, status, body=None):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError
+        return self._body
+
+
+class _HTTPError(Exception):
+    def __init__(self, status, body=None):
+        super().__init__(f"HTTP Error {status}")
+        self.response = _Resp(status, body)
+
+
+def test_classify_error_reports_real_cause():
+    from core.screener import classify_error
+
+    crumb = {"finance": {"result": None, "error": {"code": "Unauthorized", "description": "Invalid Crumb"}}}
+    e = classify_error(_HTTPError(401, crumb))
+    assert e.kind == "throttled" and "HTTP 401: Invalid Crumb" in str(e)
+    assert classify_error(_HTTPError(429)).kind == "throttled"
+    assert classify_error(_HTTPError(404)).kind == "not_found"
+    assert classify_error(_HTTPError(503)).kind == "network"
+    assert classify_error(type("YFRateLimitError", (Exception,), {})()).kind == "throttled"
+
+
+def test_fetch_retries_with_fresh_ticker_and_rejects_empty_fundamentals(monkeypatch):
+    import core.screener as screener
+    from core.screener import FetchError, fetch_fundamentals
+
+    calls = []
+
+    class FakeTicker:
+        def __init__(self, sym):
+            calls.append(sym)
+            self.n = len(calls)
+
+        @property
+        def info(self):
+            if self.n == 1:
+                raise _HTTPError(401)
+            if self.n == 2:
+                return {"symbol": "X.NS", "currentPrice": 10.0}  # quote only, no fundamentals
+            return {"symbol": "X.NS", "currentPrice": 10.0, "trailingPE": 12.0}
+
+    monkeypatch.setattr(screener.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(screener.time, "sleep", lambda s: None)
+    row = fetch_fundamentals("X.NS")
+    assert len(calls) == 3 and row["trailingPE"] == 12.0
+
+    calls.clear()
+
+    class NotFound(FakeTicker):
+        @property
+        def info(self):
+            raise _HTTPError(404)
+
+    monkeypatch.setattr(screener.yf, "Ticker", NotFound)
+    with pytest.raises(FetchError) as exc:
+        fetch_fundamentals("Y.NS")
+    assert exc.value.kind == "not_found" and len(calls) == 1  # no pointless retries
+
+
+def test_persistent_throttling_pauses_then_stops(tmp_path, monkeypatch):
+    import core.screener as screener
+    from core.screener import FetchError, fetch_and_cache_base_data
+
+    def always_throttled(yf_ticker, **kwargs):
+        raise FetchError("Yahoo Finance is rate-limiting requests (HTTP 429 Too Many Requests)", "throttled")
+
+    monkeypatch.setattr(screener, "fetch_fundamentals", always_throttled)
+    stocks = [(f"S{i}.NS", f"S{i}", "IT") for i in range(30)]
+    cache, failures, aborted = fetch_and_cache_base_data(
+        stocks, tmp_path / "b.csv", max_workers=2, request_gap=0, request_jitter=0,
+        throttle_limit=3, cooldown_seconds=0.2, max_cooldowns=1,
+    )
+    assert aborted and "rate-limiting" in aborted
+    assert len(failures) == 30
+    assert any(f["Reason"].startswith("Not downloaded") for f in failures)
+    assert not (tmp_path / "b.csv").exists()
+
+
+def test_throttling_recovers_after_cooldown(tmp_path, monkeypatch):
+    import threading
+
+    import core.screener as screener
+    from core.screener import FetchError, fetch_and_cache_base_data
+
+    lock = threading.Lock()
+    count = {"n": 0}
+
+    def flaky(yf_ticker, **kwargs):
+        with lock:
+            count["n"] += 1
+            n = count["n"]
+        if 3 <= n <= 6:
+            raise FetchError("HTTP 429", "throttled")
+        return {**{k: None for k in screener.YF_FIELDS}, "trailingPE": 10.0, "lastPrice": 1.0,
+                "fetched_at": now_ist().isoformat()}
+
+    monkeypatch.setattr(screener, "fetch_fundamentals", flaky)
+    stocks = [(f"S{i}.NS", f"S{i}", "IT") for i in range(10)]
+    cache, failures, aborted = fetch_and_cache_base_data(
+        stocks, tmp_path / "b.csv", max_workers=1, request_gap=0, request_jitter=0,
+        throttle_limit=3, cooldown_seconds=0.2, max_cooldowns=2,
+    )
+    assert aborted is None
+    assert len(cache) + len(failures) == 10
+    assert len(cache) >= 8  # the stock that hit the limit is retried after the pause
+
+
+def test_request_pacer_spaces_requests_one_at_a_time():
+    import threading
+    import time
+
+    from core.screener import RequestPacer
+
+    pacer = RequestPacer(gap=0.1, jitter=0)
+    spans = []
+
+    def request():
+        with pacer:
+            start = time.monotonic()
+            time.sleep(0.02)
+            spans.append((start, time.monotonic()))
+
+    threads = [threading.Thread(target=request) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    spans.sort()
+    for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+        assert next_start - prev_end >= 0.099  # never overlapping, always the full gap
+
+
+def test_every_yahoo_call_goes_through_the_pacer(monkeypatch):
+    import core.screener as screener
+    from core.screener import RequestPacer, fetch_fundamentals
+
+    entered = []
+
+    class CountingPacer(RequestPacer):
+        def __enter__(self):
+            entered.append(1)
+            return super().__enter__()
+
+    class T:
+        def __init__(self, sym):
+            pass
+
+        info = {"symbol": "X.NS", "trailingPE": 10.0}  # no price -> fast_info fallback
+
+        class fast_info:
+            last_price = 5.0
+
+    monkeypatch.setattr(screener.yf, "Ticker", T)
+    row = fetch_fundamentals("X.NS", pacer=CountingPacer(gap=0, jitter=0))
+    assert row["lastPrice"] == 5.0
+    assert len(entered) == 2  # info + fast_info
