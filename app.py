@@ -3,6 +3,17 @@
 import pandas as pd
 import streamlit as st
 
+from core.indianapi import (
+    DEFAULT_MAX_AGE_DAYS,
+    DEFAULT_MONTHLY_LIMIT,
+    IndianApiClient,
+    UsageCounter,
+    api_key_from_env,
+    fill_gaps,
+    load_cache,
+    month_label,
+    symbols_to_fetch,
+)
 from core.scan_history import init_db, save_scan_run
 from core.screener import (
     cache_age_summary,
@@ -18,7 +29,20 @@ from core.tickers import get_all_sectors, load_nifty500
 from core.timeutil import format_age, now_ist
 from screens.components import page_setup, render_results, result_filters, sidebar_disclaimer
 
-BASE_DATA_PATH = Path(__file__).resolve().parent / "data" / "base_data.csv"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+BASE_DATA_PATH = DATA_DIR / "base_data.csv"
+API_CACHE_PATH = DATA_DIR / "indianapi_cache.csv"
+API_USAGE_PATH = DATA_DIR / "indianapi_usage.json"
+
+
+def indianapi_key() -> str | None:
+    key = api_key_from_env()
+    if key:
+        return key
+    try:
+        return str(st.secrets["INDIANAPI_KEY"]).strip() or None
+    except Exception:  # no secrets file, or no such key
+        return None
 
 page_setup("Screener", "Fundamental screener for the Nifty 500")
 init_db()
@@ -99,6 +123,33 @@ with st.sidebar:
     else:
         st.caption("Run Scan will use cached data only.")
 
+    st.divider()
+    st.subheader("Fill gaps from IndianAPI")
+    api_key = indianapi_key()
+    use_api = False
+    monthly_limit, per_scan = DEFAULT_MONTHLY_LIMIT, 0
+    if not api_key:
+        st.caption(
+            "Not set up. To fill values Yahoo Finance does not provide (PEG, current ratio, ROE...), set the "
+            "INDIANAPI_KEY environment variable or add it to .streamlit/secrets.toml, then restart the app."
+        )
+    else:
+        use_api = st.checkbox(
+            "Fill missing values from IndianAPI", value=True,
+            help="Only fields Yahoo Finance did not provide are filled; Yahoo values are never replaced. "
+                 f"Results are reused for {DEFAULT_MAX_AGE_DAYS} days, so each stock costs about one request a month.",
+        )
+        monthly_limit = st.number_input("Monthly request limit", min_value=0, max_value=1_000_000,
+                                        value=DEFAULT_MONTHLY_LIMIT, step=500,
+                                        help="Your IndianAPI plan's monthly request allowance.")
+        per_scan = st.number_input("Max IndianAPI requests per scan", min_value=0, max_value=10_000, value=300, step=50)
+        used = UsageCounter(API_USAGE_PATH).used
+        st.caption(f"This app has used {used:,} of {monthly_limit:,} requests in {month_label()} "
+                   "(IndianAPI's dashboard has the official count).")
+        if use_api:
+            pending_api = symbols_to_fetch(cache, load_cache(API_CACHE_PATH), scope_bases)
+            st.caption(f"{len(pending_api)} stock(s) in scope have gaps not yet checked on IndianAPI.")
+
     scan_btn = st.button("Run Scan", type="primary", width="stretch", disabled=not scope)
     refresh_all = st.button(
         "Re-download all in scope, then scan", width="stretch", disabled=not scope,
@@ -117,7 +168,8 @@ sidebar_disclaimer()
 
 st.title("BAC SMA — Nifty 500 Screener")
 st.caption(
-    "Multi-factor fundamental screener. Data: NSE Indices (constituents) and Yahoo Finance (fundamentals, prices). "
+    "Multi-factor fundamental screener. Data: NSE Indices (constituents), Yahoo Finance (fundamentals, prices) "
+    "and, where Yahoo has gaps, IndianAPI. "
     "Every scan is saved to History."
 )
 
@@ -157,9 +209,27 @@ if scan_btn or refresh_all:
             )
             prog.empty()
 
+    api_cache = load_cache(API_CACHE_PATH)
+    api_outcome = None
+    if use_api:
+        pending_api = symbols_to_fetch(cache, api_cache, scope_bases)
+        if pending_api and per_scan > 0:
+            names = {t.replace(".NS", ""): n for t, n, _ in scope}
+            prog = st.progress(0.0, text=f"Filling gaps from IndianAPI for {len(pending_api)} stocks...")
+
+            def on_api_progress(done: int, total: int, symbol: str) -> None:
+                prog.progress(done / total, text=f"IndianAPI {done}/{total} — {symbol}")
+
+            client = IndianApiClient(api_key, UsageCounter(API_USAGE_PATH), monthly_limit=int(monthly_limit))
+            api_cache, api_outcome = fill_gaps(
+                client, [(sym, names[sym]) for sym in pending_api], API_CACHE_PATH, int(per_scan),
+                progress=on_api_progress,
+            )
+            prog.empty()
+
     config = load_screening_config()
     started = now_ist()
-    result = run_scan(scope, cache, config, failures)
+    result = run_scan(scope, cache, config, failures, fallback=api_cache if use_api else None)
 
     scan_type = "FULL" if select_all or set(selected_sectors) == set(all_sectors) else "SECTOR"
     scan_id = f"{scan_type}_{started:%Y%m%d_%H%M%S_%f}"
@@ -182,6 +252,8 @@ if scan_btn or refresh_all:
         "fetched": len(to_fetch),
         "download_error": download_error,
         "abort_reason": abort_reason,
+        "api_outcome": api_outcome,
+        "api_used": use_api,
     }
     st.rerun()
 
@@ -215,6 +287,20 @@ if scan:
             st.dataframe(causes, width="stretch", hide_index=True)
             st.markdown("**By stock**")
             st.dataframe(failed, width="stretch", hide_index=True)
+    if scan.get("api_used"):
+        filled_rows = pd.concat([result.scored, result.disqualified], ignore_index=True)
+        n_filled = int(filled_rows.get("Filled From IndianAPI", pd.Series(dtype=str)).fillna("").astype(bool).sum())
+        api_msg = f"IndianAPI filled missing values for {n_filled} stock(s) in this scan."
+        outcome = scan.get("api_outcome")
+        if outcome:
+            api_msg += (f" This scan checked {outcome.requested} stock(s) on IndianAPI: "
+                        f"{outcome.filled_stocks} found, {len(outcome.failures)} not usable.")
+        st.info(api_msg)
+        if outcome and outcome.stopped:
+            st.warning(f"IndianAPI: {outcome.stopped}")
+        if outcome and outcome.failures:
+            with st.expander(f"{len(outcome.failures)} IndianAPI lookup(s) not usable — details"):
+                st.dataframe(pd.DataFrame(outcome.failures), width="stretch", hide_index=True)
     render_results(
         result.scored,
         result.disqualified,

@@ -21,3 +21,8 @@ data/scan_history.db
 
 # Test cache
 .pytest_cache/
+
+# IndianAPI: key, cached lookups and this app's request counter
+.streamlit/secrets.toml
+data/indianapi_cache.csv
+data/indianapi_usage.json

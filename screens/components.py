@@ -20,7 +20,10 @@ from core.screener import (
     fetch_price_history,
     sort_scored,
 )
+from core.indianapi import FIELD_MAP
 from core.screening_logic import DEFAULT_RECOMMENDATION_THRESHOLDS, METRIC_DEFINITIONS
+
+API_KEYS = {m.label: m.keys[0] for m in FIELD_MAP}
 
 NAV = [
     ("app.py", "Screener"),
@@ -44,6 +47,7 @@ TABLE_COLS = [
     "52W Position %",
     "Data As Of",
     "Unavailable Metrics",
+    "Filled From IndianAPI",
 ]
 
 DISCLAIMER = (
@@ -114,6 +118,7 @@ def normalize_results(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["Data As Of"] = df["Data As Of"].fillna(NOT_AVAILABLE)
     df["Unavailable Metrics"] = df["Unavailable Metrics"].fillna("")
+    df["Filled From IndianAPI"] = df["Filled From IndianAPI"].fillna("")
     return df
 
 
@@ -471,6 +476,11 @@ def _render_deep_dive(df_all: pd.DataFrame, key_prefix: str) -> None:
         st.warning("Price history is not available from Yahoo Finance for this stock right now.")
 
     notes = _unavailable_by_label(row)
+    filled = {x.strip() for x in str(row.get("Filled From IndianAPI") or "").split(",") if x.strip()}
+    api_as_of = row.get("IndianAPI As Of")
+    api_date = f" (as of {api_as_of})" if isinstance(api_as_of, str) and api_as_of else ""
+    if filled:
+        st.info(f"Filled from IndianAPI{api_date} because Yahoo Finance did not provide them: {', '.join(sorted(filled))}.")
     lines = []
     for metric in METRIC_DEFINITIONS:
         col = metric["column"]
@@ -489,8 +499,13 @@ def _render_deep_dive(df_all: pd.DataFrame, key_prefix: str) -> None:
                 points = NOT_AVAILABLE
             else:
                 points = f"{pts:.1f} / {mx:g}"
+        source = metric["source"]
+        if metric["label"] in filled:
+            source = f"IndianAPI `{API_KEYS[metric['label']]}`{api_date}"
+        elif metric["label"] == "FCF Yield" and "Market cap" in filled:
+            source = f"Yahoo Finance `freeCashflow` / IndianAPI market cap{api_date}"
         lines.append({"Metric": metric["label"], "Value": shown, "Points": points,
-                      "Note": note or "", "Source": metric["source"]})
+                      "Note": note or "", "Source": source})
     left, right = st.columns([3, 2])
     with left:
         st.markdown("#### Fundamentals and points")
