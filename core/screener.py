@@ -28,6 +28,7 @@ from core.screening_logic import (
     METRIC_DEFINITIONS,
     metric_lookup,
 )
+from core.indianapi import DEFAULT_MAX_AGE_DAYS, merge_fallback
 from core.tickers import FINANCIAL_SECTORS
 from core.timeutil import IST, NSE_CLOSE, now_ist, parse_timestamp
 
@@ -304,9 +305,15 @@ def score_stock(raw: dict[str, Any], ticker: str, name: str, sector: str, config
         "Data As Of": fetched_at.strftime("%Y-%m-%d %H:%M IST") if fetched_at else NOT_AVAILABLE,
     }
 
+    filled = list(raw.get("_filled") or [])
+    sources = {"Filled From IndianAPI": ", ".join(filled), "IndianAPI As Of": raw.get("_filled_as_of") if filled else None}
+
     reasons = apply_hard_filters(raw, sector)
     if reasons:
-        return {**base, "Status": "DISQUALIFIED", "Reason": "; ".join(reasons)}
+        reason = "; ".join(reasons)
+        if filled:
+            reason += f" (values filled from IndianAPI: {', '.join(filled)})"
+        return {**base, "Status": "DISQUALIFIED", "Reason": reason, **sources}
 
     price = to_number(raw.get("lastPrice"))
     hi = to_number(raw.get("fiftyTwoWeekHigh"))
@@ -332,6 +339,11 @@ def score_stock(raw: dict[str, Any], ticker: str, name: str, sector: str, config
         "52W Position %": w52_pos,
     }
     record.update(_combine(compute_metrics(raw, sector), config))
+    if raw.get("_fallback_checked") and record["Unavailable Metrics"]:
+        record["Unavailable Metrics"] = record["Unavailable Metrics"].replace(
+            "not provided by Yahoo Finance", "not provided by Yahoo Finance or IndianAPI"
+        )
+    record.update(sources)
     return record
 
 
@@ -714,10 +726,16 @@ def run_scan(
     cache: pd.DataFrame,
     config: dict,
     fetch_failures: list[dict[str, str]] | None = None,
+    fallback: pd.DataFrame | None = None,
+    fallback_max_age_days: float = DEFAULT_MAX_AGE_DAYS,
 ) -> ScanResult:
-    """Score every in-scope stock that has cached data; account for the rest."""
+    """Score every in-scope stock that has cached data; account for the rest.
+
+    `fallback` is the IndianAPI cache; it only fills fields Yahoo did not provide.
+    """
     failure_reasons = {f["Ticker"]: f["Reason"] for f in (fetch_failures or [])}
     rows = cache.set_index("Ticker").to_dict(orient="index") if not cache.empty else {}
+    api_rows = fallback.set_index("Ticker").to_dict(orient="index") if fallback is not None and not fallback.empty else {}
 
     scored, disqualified, unavailable = [], [], []
     for yf_t, name, sector in stocks:
@@ -731,13 +749,18 @@ def run_scan(
                 "Reason": failure_reasons.get(base, "No fundamental data has been downloaded for this stock"),
             })
             continue
+        if fallback is not None:
+            raw = merge_fallback(raw, api_rows.get(base), fallback_max_age_days)
         record = score_stock(raw, base, name, sector, config)
         (disqualified if record["Status"] == "DISQUALIFIED" else scored).append(record)
 
     scored_df = sort_scored(pd.DataFrame(scored))
     return ScanResult(
         scored=scored_df,
-        disqualified=pd.DataFrame(disqualified, columns=["Ticker", "Name", "Sector", "Data As Of", "Status", "Reason"]),
+        disqualified=pd.DataFrame(
+            disqualified,
+            columns=["Ticker", "Name", "Sector", "Data As Of", "Status", "Reason", "Filled From IndianAPI", "IndianAPI As Of"],
+        ),
         unavailable=pd.DataFrame(unavailable, columns=["Ticker", "Name", "Sector", "Reason"]),
         in_scope=len(stocks),
     )

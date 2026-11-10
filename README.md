@@ -62,6 +62,8 @@ All triggered reasons are listed in the **Excluded** tab.
   the download pauses for 60 s (up to twice), retries the affected stocks, and otherwise stops with a clear
   message instead of marking hundreds of stocks as failed. The sidebar shows an estimated download time;
   a full Nifty 500 download takes roughly 20 minutes at the default gap.
+- **Gap filling from IndianAPI (optional).** When Yahoo Finance has no value for a metric, the scan can fetch
+  it from [IndianAPI](https://indianapi.in/indian-stock-market) instead. See *Filling gaps from IndianAPI* below.
 - Tabs: Dashboard (counts, mix, sector averages, score distribution, data availability per metric),
   Screener (sortable table, CSV export), Top Picks, Deep Dive (price chart, per-metric values and points,
   sources), Excluded (disqualified and unavailable stocks).
@@ -78,6 +80,7 @@ All triggered reasons are listed in the **Excluded** tab.
 .
 |-- app.py                       # Screener page
 |-- core/
+|   |-- indianapi.py             # Optional IndianAPI gap filling
 |   |-- scan_history.py          # SQLite scan history
 |   |-- screener.py              # Data download, scoring, hard filters, returns
 |   |-- screening_logic.py       # Metric definitions and JSON settings
@@ -101,11 +104,54 @@ streamlit run app.py
 
 Run the tests with `python -m pytest tests`.
 
+## Filling gaps from IndianAPI
+
+Yahoo Finance does not publish every metric for every Indian stock (PEG is the most common gap).
+The app can fill **only those missing values** from IndianAPI's Indian Stock Market API. Yahoo values
+are never overwritten.
+
+**Setup.** Get an API key at [indianapi.in](https://indianapi.in/indian-stock-market) (the free plan
+allows about 5,000 requests a month). Then either set an environment variable:
+
+```bash
+export INDIANAPI_KEY=your-key        # Windows: set INDIANAPI_KEY=your-key
+```
+
+or add it to `.streamlit/secrets.toml` (already in `.gitignore`):
+
+```toml
+INDIANAPI_KEY = "your-key"
+```
+
+Without a key the sidebar says the feature is not set up and scans use Yahoo Finance only.
+
+**What can be filled:** P/E, PEG, P/B, ROE, ROA, operating margin, revenue growth, earnings growth,
+debt/equity, current ratio and market cap. IndianAPI's free cash flow uses a different definition from
+Yahoo's, so it is not used.
+
+**Safeguards**
+
+- Only stocks with gaps are requested: one request by NSE symbol, and a second by company name only if the
+  symbol is not found. Requests go one at a time with a 1.5 s gap.
+- The match is checked against the NSE symbol. If IndianAPI returns a different company, nothing is used.
+- Values dated more than 30 days ago are rejected.
+- Results, including "not found" answers, are cached for 30 days in `data/indianapi_cache.csv`, so each stock
+  is requested at most about once a month.
+- The sidebar sets a monthly limit (default 5,000) and a per-scan limit (default 300), and shows how many
+  requests the app has used this month (counted in `data/indianapi_usage.json`). The provider's own count is
+  authoritative, since other apps using the same key are not counted here.
+- An invalid key or an exhausted quota stops gap filling at once, with a clear message. The scan still completes
+  with Yahoo data.
+
+**Where it shows.** The Screener table has a *Filled From IndianAPI* column. Deep Dive marks each filled value
+with its IndianAPI field and date. If neither source has a value, it is reported as
+"not provided by Yahoo Finance or IndianAPI".
+
 ## Data sources and limitations
 
 - NSE Indices (`niftyindices.com`) for constituents; Yahoo Finance (via `yfinance`) for fundamentals
-  and prices. Yahoo data can be delayed, incomplete or wrong, and Yahoo does not publish PEG for
-  many Indian stocks.
+  and prices; optionally IndianAPI for fundamentals Yahoo lacks. Yahoo data can be delayed, incomplete
+  or wrong, and Yahoo does not publish PEG for many Indian stocks.
 - Growth metrics are single-quarter year-over-year figures and can be distorted by one-off items.
 - No qualitative factors (management, governance, moat).
 
